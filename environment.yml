@@ -1,0 +1,18 @@
+# Creates the `gap-inr` environment:
+#   conda env create -f environment.yml && conda activate gap-inr
+#
+# Conda provides only the interpreter; every dependency comes from requirements.txt, so this and a
+# plain `pip install -r requirements.txt` into a venv resolve to the same environment. PyTorch is
+# installed from PyPI: if you need a CUDA build other than the default, install torch first from the
+# matching index (see the note at the top of requirements.txt), then create this environment.
+#
+# To also run the ImageFlowNet comparison baselines, add their extras:
+#   pip install -r baselines/imageflownet/requirements.txt
+name: gap-inr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - -r requirements.txt

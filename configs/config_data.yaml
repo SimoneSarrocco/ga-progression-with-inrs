@@ -1,0 +1,101 @@
+# Dataset sections. `config_data:` in config_model.yaml (or `--config_data` on the command line)
+# selects which one a run uses; `faf_ga` below is the base and every other section inherits it with
+# `<<: *faf_ga`, overriding only the sampling geometry. Conditions, normalisation, constraints and
+# the split therefore live in ONE place -- edit them here and every variant follows.
+faf_ga: &faf_ga
+  dataset_name: faf_ga
+  independent_visits: false  # if true: one latent vector for each visit
+  mask_grader_mode: 'majority' #  ('single' | 'majority' | 'augment' train-only | 'soft' per-pixel mean of graders)
+  subject_ids: ./configs/subject_ids.yaml
+  id_column: Eye_ID
+  split_column: split
+  # Longitudinal clinical/metadata table (one row per patient-eye visit); see docs/DATA.md for
+  # the required columns. Point this at your own CSV.
+  tsv_file: './data/clinical_metadata.csv'
+  modalities: ['faf_path', 'ga_mask_path']
+  # OPTIONAL remote store. lakeFS (https://lakefs.io) is an open-source data-versioning layer over
+  # an S3-compatible bucket; images are fetched to `cache_path` on first use. Leave the loader
+  # unconfigured (no credentials file) to read images directly from local disk instead, see
+  # docs/DATA.md. Credentials are read from an external file (never committed); see
+  # configs/lakefs_cfg.example.yaml.
+  lakefs:
+    repo: your-lakefs-repo
+    branch: main
+    cache_path: ./cache/faf_ga
+  conditions:
+    AgeatVisit: true          # FiLM conditioning
+    weeks_from_baseline: true  # FiLM conditioning
+  temporal_condition: weeks_from_baseline
+  extrapolate_beyond_range: true
+  weeks_constraint_from_dates: true    # derive weeks_from_baseline [min,max] from visit_date at load
+  min_valid_visits_eval: 2             # val/test: drop eyes with fewer valid visits (LOO needs >=2)
+  constraints:
+    weeks_from_baseline:
+      type: numeric
+      min: 0.0
+      max: 54.143
+    AgeatVisit:
+      type: numeric
+      min: 66.0
+      max: 91.0
+      distribution:
+        type: 'uniform'
+        priority: 10
+  label_names: ['BG', 'GeographicAtrophy']
+  class_weights: [1.0, 1.0]    # Cross-entropy class weights.
+  world_bbox: [620, 620]  # centre-crop to 620x620 to remove the influence of the black frames introduced by image registration
+  sampling_strategy: 'all' # 'all' or 'mask' --> 'all': we sample coordinates/pixels from the whole image; 'mask': we sample coordinates/pixels only inside the GA lesion
+  normalize_values: 'minmax'
+  visit_week_map:
+    1: 0
+    2: 12
+    3: 24
+    4: 48
+  sampling_bbox: [620, 620]  # the sampling grid size --> we generate 620x620 images
+
+
+# ---------------------------------------------------------------------------------------------
+# Sampling-grid variants of the base section. All of them keep its conditioning (FiLM over
+# weeks-from-baseline + age at visit, temporal axis = weeks_from_baseline) and differ ONLY in the
+# geometry three keys describe:
+#   crop_before_resize  centre-crop applied to the native image BEFORE resizing (the field of view)
+#   world_bbox          the grid the INR is sampled on (the resolution)
+#   sampling_bbox       null -> use world_bbox; a value here crops the grid instead of resizing to it
+# GAP-INR is a coordinate-based decoder, so a checkpoint trained at one grid can be EVALUATED at any
+# other without retraining: pass `evaluate.py --config_data <section>`. Only _512 is meant for
+# training (it is what config_model.yaml selects and what the paper model used).
+# ---------------------------------------------------------------------------------------------
+
+# PAPER MODEL. 620 centre-crop -> 512 grid. Train with this (config_model.yaml `config_data`).
+faf_ga_twovar_wktemporal_512:
+  <<: *faf_ga
+  crop_before_resize: [620, 620]
+  world_bbox: [512, 512]
+  sampling_bbox: null
+
+# EVAL ONLY -- 620 crop -> 256 grid, matching the ImageFlowNet baselines' native resolution
+# (baselines/imageflownet). Use for the extrapolation comparison when you want GAP-INR to both
+# render and score on IFN's grid.
+faf_ga_twovar_wktemporal_256:
+  <<: *faf_ga
+  crop_before_resize: [620, 620]
+  world_bbox: [256, 256]
+  sampling_bbox: null
+
+# EVAL ONLY -- native 620 centre-crop, no resize. The interpolation grid (GAP-INR only; the
+# forward-only baselines cannot interpolate a held-out interior visit).
+faf_ga_twovar_wktemporal_620:
+  <<: *faf_ga
+  world_bbox: [620, 620]
+  sampling_bbox: [620, 620]
+
+# EVAL ONLY -- render at the checkpoint's NATIVE 512 grid, then resize BOTH prediction and ground
+# truth to 256 immediately before scoring (`metric_resize`). This is the fair extrapolation setup
+# against ImageFlowNet: same field of view (620 crop) and same metric resolution (256), without
+# forcing the INR to sample on an off-training grid. Hausdorff distances are then in 256-grid pixels.
+faf_ga_twovar_wktemporal_512_to256:
+  <<: *faf_ga
+  crop_before_resize: [620, 620]
+  world_bbox: [512, 512]
+  sampling_bbox: null
+  metric_resize: [256, 256]
