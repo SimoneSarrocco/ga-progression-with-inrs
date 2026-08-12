@@ -8,7 +8,7 @@ and the figures.
 <div align="center">
 
 [![arXiv](https://img.shields.io/badge/arXiv-darkred?logo=arXiv&labelColor=darkred
-)]()
+)](https://arxiv.org/abs/2608.10807)
 [![Project Page](https://img.shields.io/badge/Project%20Page-black?logo=github
 )](https://simonesarrocco.github.io/geographic-atrophy-progression-inr/)
 [![MICCAI Workshop](https://img.shields.io/badge/MICCAI%20OffGrid%20Workshop-purple)](https://off-grid-workshop.github.io/)
