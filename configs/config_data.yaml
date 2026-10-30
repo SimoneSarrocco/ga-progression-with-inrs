@@ -1,7 +1,7 @@
 # Dataset sections. `config_data:` in config_model.yaml (or `--config_data` on the command line)
-# selects which one a run uses; `faf_ga` below is the base and every other section inherits it with
-# `<<: *faf_ga`, overriding only the sampling geometry. Conditions, normalisation, constraints and
-# the split therefore live in ONE place -- edit them here and every variant follows.
+# selects which one a run uses; `faf_ga` below is the base and other sections inherit it with
+# `<<: *faf_ga`. Conditions, normalisation, constraints and the split therefore live in ONE place;
+# grid variants override geometry, while faf_slo_ga_* additionally declares its modality keys/roles.
 faf_ga: &faf_ga
   dataset_name: faf_ga
   independent_visits: false  # if true: one latent vector for each visit
@@ -13,6 +13,10 @@ faf_ga: &faf_ga
   # the required columns. Point this at your own CSV.
   tsv_file: './data/clinical_metadata.csv'
   modalities: ['faf_path', 'ga_mask_path']
+  modality_roles:
+    faf_path: reconstruction
+    ga_mask_path: segmentation
+  primary_reconstruction_modality: faf_path
   # OPTIONAL remote store. lakeFS (https://lakefs.io) is an open-source data-versioning layer over
   # an S3-compatible bucket; images are fetched to `cache_path` on first use. Leave the loader
   # unconfigured (no credentials file) to read images directly from local disk instead, see
@@ -69,6 +73,19 @@ faf_ga: &faf_ga
 # PAPER MODEL. 620 centre-crop -> 512 grid. Train with this (config_model.yaml `config_data`).
 faf_ga_twovar_wktemporal_512:
   <<: *faf_ga
+  crop_before_resize: [620, 620]
+  world_bbox: [512, 512]
+  sampling_bbox: null
+
+# MULTIMODAL MODEL. One ordered target triplet [FAF, SLO, GA] per eye-visit.
+faf_slo_ga_twovar_wktemporal_512:
+  <<: *faf_ga
+  modalities: ['faf_path', 'slo_path', 'ga_mask_path']
+  modality_roles:
+    faf_path: reconstruction
+    slo_path: reconstruction
+    ga_mask_path: segmentation
+  primary_reconstruction_modality: faf_path
   crop_before_resize: [620, 620]
   world_bbox: [512, 512]
   sampling_bbox: null

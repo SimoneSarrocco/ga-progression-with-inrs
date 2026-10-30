@@ -1,8 +1,8 @@
 # Preprocessing
 
-Scripts that assemble the clinical metadata table and the train/val/test split the training code
-reads. They are cohort-specific and are provided to **document** how the paper's CSV was built. Please
-adapt the column names and paths (`./data/...`) to your own data before running.
+Scripts that assembled the clinical metadata table and the train/val/test split the training code
+reads. They are cohort-specific and document how the paper's CSV was built; adapt the column names and
+paths (`./data/...`) to your own data before running them.
 
 | Script | What it does |
 |---|---|
@@ -19,6 +19,5 @@ These are **not** a pipeline to run against a CSV you already have, and they are
   after which `validate_splits` aborts every run against `configs/expected_split.yaml`. It refuses to
   be imported (it would rewrite the CSV at import time), so run it as a script or not at all.
 
-So: read them to see how the shipped CSV was produced, and adapt them to your own cohort. Do not run
-them against the CSV from [`../docs/DATA.md`](../docs/DATA.md), that CSV is already the finished
-product `configs/config_data.yaml → tsv_file` points at. See that document for the required columns.
+Do not run them against a CSV that already has the columns of [`../docs/DATA.md`](../docs/DATA.md):
+that CSV is already the finished table that `tsv_file` in `configs/config_data.yaml` points at.

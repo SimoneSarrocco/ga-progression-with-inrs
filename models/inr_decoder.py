@@ -351,9 +351,6 @@ class INR_Decoder(nn.Module):
             t = -torch.einsum('nij,nj->ni', R, t)
         return torch.einsum('nxy,ny->nx', R, coords) + t
 
-    @staticmethod
-    
-
     def mask_reconstruction(self, recs, seg):
         mask = self.connected_components(seg)
         mask = mask.expand_as(recs)

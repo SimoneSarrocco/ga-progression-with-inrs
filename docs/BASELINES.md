@@ -21,40 +21,36 @@ and its [ATTRIBUTION.md](../baselines/imageflownet/ATTRIBUTION.md) for provenanc
 All three share one harness. T-UNet and T-I2SBUNet are the two comparison methods used by the
 ImageFlowNet paper itself.
 
-## What makes the comparison fair
+## What the comparison shares
 
-Every method trains and evaluates on the **same eyes**, the **same visits** and is scored on the
-**same 512 grid**, enforced in code rather than by convention. Note that the scoring grid and a
-method's working resolution are different things: the ImageFlowNet models run at `--target-dim
-(256,256)`, and their predictions and the ground truth are both resized to the 512 scoring grid
-(`METRIC_DIM`) before any metric is computed, exactly as for GAP-INR.
-
-- **Split.** Both the baselines and GAP-INR read the `split` column of the same clinical CSV
-  (see [`DATA.md`](DATA.md)). GAP-INR checks the resolved eyes against
-  [`configs/expected_split.yaml`](../configs/expected_split.yaml); the baselines check theirs against
-  `baselines/imageflownet/eval_spec.py`, which hard-asserts that the scored test eyes are exactly
-  GAP-INR's test eyes.
-- **Preprocessing.** `baselines/imageflownet/common_preproc.py` is the same per-visit min-max
-  normalisation GAP-INR applies, and the same 620-crop-then-resize geometry.
-- **Protocol.** Leave-one-visit-out folds, bucketed into interpolation (a middle visit is held out)
-  and extrapolation (the last visit is held out).
-
-The two split contracts count eyes differently on purpose, and both are correct. GAP-INR's
-`expected_split.yaml` lists the eyes with a modality path in the CSV (25 train); `eval_spec.py` lists
-the *longitudinal* eyes, meaning at least two visits whose FAF **and** GA-mask files are both on disk (23
-train). Val (5) and test (6) are identical under both, because every val/test visit is complete. So
-the **scored test set is the same for every method** regardless of internal filtering.
+- **Test eyes.** Both the baselines and GAP-INR read the `split` column of the same clinical CSV (see
+  [`DATA.md`](DATA.md)). GAP-INR checks its resolved eyes against
+  [`configs/expected_split.yaml`](../configs/expected_split.yaml); the baselines' evaluation
+  hard-asserts that the eyes it scores are exactly the six test eyes of
+  `baselines/imageflownet/eval_spec.py`, which are GAP-INR's test eyes.
+- **Training eyes.** `eval_spec.py` counts only longitudinal eyes, meaning at least two visits whose
+  FAF and grader-1 mask files are both on disk: 23 train eyes. `expected_split.yaml` counts every
+  training eye with a FAF path: 26 train eyes, because GAP-INR also trains on eyes with a single usable
+  visit and its majority vote can use grader 2 or 3 when grader 1 is missing. Validation (5) and
+  test (6) are identical under both.
+- **Geometry and intensity.** The same 620 centre-crop of the native image, then a resize (FAF bicubic
+  in the baselines, bilinear in GAP-INR; masks nearest in both), and the same per-visit min-max
+  normalisation.
+- **Scoring grid.** The paper runs the baselines at `--target-dim (256,256)`, so they are trained,
+  rendered and scored at 256x256 (`METRIC_DIM` equals the model grid unless `--metric-resize` is
+  given). Hausdorff distances are then in 256-grid pixels. To score GAP-INR on the same grid, evaluate
+  it with `--config_data faf_ga_twovar_wktemporal_512_to256`, which renders at 512 and resizes
+  prediction and ground truth to 256 before scoring.
 
 ## Protocol
 
-The ImageFlowNet family outputs **images only**, so geographic-atrophy DICE is computed by passing
-the predicted FAF through a **single frozen segmentor trained once and reused for all three
-forecasters** (so DICE differences reflect the forecaster, not the segmentor). GA is scored against
-the **real GA masks**, not against the segmentor's reading of the ground-truth image.
+The ImageFlowNet family outputs images only, so GA DICE is computed by passing the predicted FAF
+through a single frozen segmentor, trained once and reused for all three forecasters. GA is scored
+against the real GA masks, not against the segmentor's reading of the ground-truth image.
 
 ```bash
 cd baselines/imageflownet/src
-SEG='$ROOT/checkpoints/segment_retina_faf_ga_512_seed1.pty'
+SEG='$ROOT/checkpoints/segment_retina_faf_ga_512_seed1.pty'   # $ROOT is expanded by the scripts
 
 # 0. shared segmentor (train once)
 python train_segmentor.py --dataset-name retina_faf_ga --target-dim '(256,256)' --segmentor-ckpt "$SEG"
@@ -64,28 +60,34 @@ python train_2pt_all.py --dataset-name retina_faf_ga --target-dim '(256,256)' --
 python train_2pt_all.py --dataset-name retina_faf_ga --target-dim '(256,256)' --model T_UNet        --segmentor-ckpt "$SEG"
 python train_2pt_all.py --dataset-name retina_faf_ga --target-dim '(256,256)' --model I2SBUNet --diffusion-interval 100 --segmentor-ckpt "$SEG"
 
-# 4. evaluation (paper numbers): PSNR/SSIM + DICE(segmentor(pred FAF), real GA mask), bucketed into
-# interpolation (target is a middle visit) vs extrapolation (target is the last visit).
+# 4. evaluation (paper numbers): PSNR/SSIM/LPIPS + DICE(segmentor(pred FAF), real GA mask)
 python eval_faf_ga.py --model ImageFlowNetODE --target-dim '(256,256)' --segmentor-ckpt "$SEG"
 python eval_faf_ga.py --model T_UNet          --target-dim '(256,256)' --segmentor-ckpt "$SEG"
 python eval_faf_ga.py --model I2SBUNet        --target-dim '(256,256)' --diffusion-interval 100 --segmentor-ckpt "$SEG"
 ```
 
+The segmentor checkpoint keeps its historical name (`..._512_...`) although it is trained at 256 here.
+
 ### Paper configuration
 
-- **Resolution 256×256, seed 1.** This is the configuration reported in the paper.
-- `--diffusion-interval` (I2SBUNet only, default 100) is the number of diffusion steps and **must
-  match** between training and evaluation. T-UNet / ImageFlowNetODE ignore it.
-- **Scenario 1** = single-pair forecast (older visit → newer visit). **Scenario 2** = full patient
-  history via test-time adaptation. T-I2SBUNet has no test-time-adaptation mechanism, so **Scenario 2
-  is not applicable to it**.
+- **Resolution 256x256, seed 1.**
+- `--diffusion-interval` (I2SBUNet only, default 100) is the number of diffusion steps and must
+  match between training and evaluation. T-UNet and ImageFlowNetODE ignore it.
+- **Scenario 1** is a single-pair forecast: for every pair of visits (a, b) with a before b, visit b
+  is predicted from visit a alone. Visit 1 is never a target. A pair counts as extrapolation when b is
+  the eye's last visit and as interpolation otherwise, so on the 6 test eyes there are 36 pairs, 18 in
+  each bucket. GAP-INR's `evaluate.py --pairwise` runs the same protocol.
+- **Scenario 2** uses the full patient history through test-time optimisation. T-I2SBUNet has no
+  test-time optimisation, so scenario 2 does not apply to it.
 
-Each run writes a `leave_one_out_summary_test_<best_type>.csv` (`leave_one_out_summary_test_seg_dice.csv`
-with the default `--best-type seg_dice`) in the same format as GAP-INR's
-[`summarise_eval.py`](../summarise_eval.py), so the final comparison table reads identical fields
-(DICE / PSNR / SSIM / Hausdorff distance / lesion-area MAE, interpolation vs extrapolation) across
-every method. A copy-forward reference (predict the source visit unchanged) is scored alongside as
-the floor a forecaster has to beat.
+Each run writes `leave_one_out_summary_test_<best_type>.csv` (`..._seg_dice.csv` with the default
+`--best-type seg_dice`), plus `..._copyforward_<best_type>.csv` for the copy-forward reference
+(predict the source visit unchanged) and, for scenario 2, `..._tto_<best_type>.csv`. These files
+report the same metrics as GAP-INR's [`summarise_eval.py`](../summarise_eval.py) (DICE, PSNR, SSIM,
+LPIPS, Hausdorff distance, lesion-area MAE, interpolation vs extrapolation, and minor/major GA
+growth), but in their own layout (`Set`, `<metric>_mean`, `<metric>_std`, `n`) and pooled over pairs,
+whereas `summarise_eval.py` reports the mean and standard error over eyes.
 
-Classical non-learned floors (linear / cubic-spline interpolation, growth-rate and linear-regression
-area extrapolation, copy-forward) live in `baselines/imageflownet/comparison/interpolation/`.
+Classical non-learned references live in `baselines/imageflownet/comparison/interpolation/`:
+per-pixel linear, linear-regression and cubic-spline interpolation/extrapolation, GA-area growth-rate
+extrapolation, and copy-forward.

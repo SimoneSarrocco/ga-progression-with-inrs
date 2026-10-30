@@ -17,6 +17,10 @@ and the script finds nothing.
                                read, so it must follow this naming:
                                  contains "eval"       held-out visits (read)
                                  contains "opt"        fitted visits (skipped)
+                                 contains "loo_avg"    pooled copy of the per-position
+                                                       files (skipped)
+                                 contains "pair_V"     per-pair forecast (skipped; build_model
+                                                       writes its own pairwise summary)
                                  starts "val"/"test"   which split the row lands in
                                  "holdout_V<p>"        hold-out position p, 1-indexed
                                                        (absent means a single
@@ -30,9 +34,9 @@ and the script finds nothing.
                                The epoch comes from the file name ("epoch_<n>").
   **/lesion_monotonicity*.csv  Optional. Adds the monotonicity violation rate.
 
-Passing --data_csv <clinical_metadata.csv> also splits every row into minor- and
-major-growth buckets. Growth is 1 - DSC(previous visit, held-out visit) measured on
-the raw ground-truth masks. It is therefore a property of the data rather than of
+Passing --data_csv <clinical_metadata.csv> also splits every held-out visit into minor-
+and major-growth buckets. Growth is 1 - DSC(previous visit, held-out visit) measured on
+the raw ground-truth masks, looked up by eye and visit number. It is therefore a property of the data rather than of
 the model, and is directly comparable with the ImageFlowNet baselines. That CSV
 needs a ga_mask_path column. Masks are read on the canonical grid: --crop_size 620
 centre-crop, then resize to --score_res 512 with nearest neighbour, then binarise
@@ -47,18 +51,27 @@ The same table is printed to stdout. There is one row per (split, group), where
 group is one of:
 
   V<p> (interpolation|extrapolation)   a single hold-out position
-  last (extrapolation)                 the single-hold-out run
+  last (extrapolation)                 the single-hold-out run ('<tag> (extrapolation)'
+                                       for other single rounds, e.g. test_supportk1)
   interpolation, extrapolation         pooled over positions
   ALL                                  pooled over everything
   minor_growth, major_growth           only with --data_csv
 
+A held-out visit counts as extrapolation when it is the last visit of its own eye,
+and as interpolation otherwise. Holding out visit 1 is therefore in the
+interpolation bucket although the latent is fitted only on later visits; the V1 row
+reports it separately.
+
 Columns are split, group, <metric>_mean and <metric>_se for each of --metrics
-(default: DICE Precision Recall IoU HD PSNR SSIM LPIPS LOSS), and
-n_heldout_visits.
+(default: DICE Precision Recall IoU HD PSNR SSIM LPIPS LOSS, plus discovered
+modality-prefixed metrics such as FAF_PSNR and SLO_PSNR), n_heldout_visits,
+areaMAE_mean/_se (lesion-area MAE per bucket), area_MAE_mm2 (lesion-area MAE of
+the last hold-out round, on the extrapolation row) and mono_decrease_mm2.
 
 Metrics are aggregated per patient-eye: averaged within an eye first, then mean and
-standard error over eyes. So n is the number of eyes (6 on the test split), and an
-eye with more held-out visits does not count for more.
+standard error over eyes. So n_heldout_visits is the number of eyes (6 on the test
+split), and an eye with more held-out visits does not count for more. The growth
+rows are the exception: they pool held-out visits, and n_heldout_visits counts visits.
 
 By default every validation epoch in the directory is pooled, which shows the
 training trajectory. Pass --best_checkpoint to report the single best validation
@@ -111,23 +124,43 @@ def _dsc(a, b):
 
 
 def _eye_growth(data_csv, crop, res):
-    """{eye_id: [growth per chronological visit]} where growth[k] = 1 - DSC(mask[k-1], mask[k])
-    from the RAW GT masks (growth[0] uses mask[0]<->mask[1]). GT-only, so identical across methods
-    and matched to the ImageFlowNet baselines' eval_faf_ga.py definition. The k-th value aligns with the eye's k-th
-    held-out position (by RANK), which is robust to 0- vs 1-based holdout numbering."""
+    """{eye_id: {visit_number: growth}} with growth = 1 - DSC(previous visit's mask, this visit's
+    mask) from the RAW GT masks (the first visit uses its successor). GT-only, so identical across
+    methods and matched to the ImageFlowNet baselines' eval_faf_ga.py definition. Keyed by
+    Visit_Number, the same number the metric JSONs carry in their Subject field (EYE09_OS_V2)."""
     df = pd.read_csv(data_csv).dropna(subset=["ga_mask_path"])
-    sort_col = "Visit_Number" if "Visit_Number" in df.columns else None
     out = {}
     for eye, g in df.groupby("Eye_ID"):
-        g = g.sort_values(sort_col) if sort_col else g
-        masks = [_load_mask_512(p, crop, res) for p in g["ga_mask_path"]
-                 if isinstance(p, str) and os.path.exists(p)]
-        if len(masks) < 2:
-            out[str(eye)] = [0.0] * len(masks)
+        g = g.sort_values("Visit_Number")
+        vis = [(int(v), _load_mask_512(p, crop, res)) for v, p in zip(g["Visit_Number"], g["ga_mask_path"])
+               if isinstance(p, str) and os.path.exists(p)]
+        if len(vis) < 2:
+            out[str(eye)] = {v: 0.0 for v, _ in vis}
             continue
-        gr = [1.0 - _dsc(masks[max(k - 1, 0)], masks[k]) for k in range(len(masks))]
-        gr[0] = 1.0 - _dsc(masks[0], masks[1])
+        gr = {vis[k][0]: 1.0 - _dsc(vis[k - 1][1], vis[k][1]) for k in range(1, len(vis))}
+        gr[vis[0][0]] = 1.0 - _dsc(vis[0][1], vis[1][1])
         out[str(eye)] = gr
+    return out
+
+
+def _eye_of(subject):
+    """'EYE09_OS_V2' -> 'EYE09_OS' (the Subject field is per held-out visit)."""
+    return re.sub(r"_V[\d.]+$", "", str(subject))
+
+
+def _visit_of(subject):
+    """'EYE09_OS_V2' -> 2, or None when the Subject carries no visit number."""
+    m = re.search(r"_V([\d.]+)$", str(subject))
+    return int(float(m.group(1))) if m else None
+
+
+def _subset(r, keep):
+    """Copy of a metric record restricted to the entries whose index is in `keep`."""
+    keep = sorted(keep)
+    out = dict(r)
+    out["subjects"] = [r["subjects"][i] for i in keep]
+    out["kinds"] = [r["kinds"][i] for i in keep] if "kinds" in r else None
+    out["metrics"] = {m: [v[i] for i in keep if i < len(v)] for m, v in r["metrics"].items()}
     return out
 
 
@@ -184,10 +217,10 @@ def _select_best_epoch(rows, criterion="DICE"):
 
 
 def main():
+    default_metrics = ["DICE", "Precision", "Recall", "IoU", "HD", "PSNR", "SSIM", "LPIPS", "LOSS"]
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval_dir", required=True)
-    ap.add_argument("--metrics", nargs="+",
-                    default=["DICE", "Precision", "Recall", "IoU", "HD", "PSNR", "SSIM", "LPIPS", "LOSS"])
+    ap.add_argument("--metrics", nargs="+", default=default_metrics)
     # Optional minor/major GA-growth stratification (ImageFlowNet Table 1 framing). Pass the data
     # CSV (with ga_mask_path) to enable it; growth = 1 - DSC(prev visit, held-out visit) from the GT
     # masks, identical to the ImageFlowNet baselines. Off by default -> existing summary is unchanged.
@@ -206,6 +239,7 @@ def main():
 
     # 1. Gather held-out metric JSONs by (split, position).
     rows = []  # one row per (split, position) with per-eye metric arrays
+    n_pair = 0
     for jp in glob.glob(os.path.join(args.eval_dir, "**", "*metrics*.json"), recursive=True):
         name = os.path.basename(os.path.dirname(jp))
         # held-out sets only: val_eval_holdout_V{p}, test_eval(_test), *_eval*
@@ -214,17 +248,30 @@ def main():
             continue
         if "opt" in name:        # skip the observed-visit (opt) sets
             continue
+        if "loo_avg" in name:    # pooled copy of the per-position files; counting it would double every visit
+            continue
+        if "pair_V" in name:     # per-pair forecast: summarised by build_model (leave_one_out_summary_pairwise.csv)
+            n_pair += 1
+            continue
         split = "val" if name.startswith("val") else ("test" if name.startswith("test") else "other")
         pos = int(m.group(1)) if m else None     # None = single hold-out (e.g. test 'last')
+        tag = name.split("_eval_", 1)[1] if "_eval_" in name else ""
         ep_m = re.search(r"ep=(\d+)", os.path.basename(jp))   # epoch is in the FILENAME, not the dir
         epoch = int(ep_m.group(1)) if ep_m else None
         metrics, subjects = _load_metric_json(jp)
-        rows.append({"split": split, "position": pos, "epoch": epoch,
+        rows.append({"split": split, "position": pos, "epoch": epoch, "tag": tag,
                      "metrics": metrics, "subjects": subjects})
+    if n_pair:
+        print(f"Skipped {n_pair} per-pair record(s); see leave_one_out_summary_pairwise.csv.")
 
     if not rows:
         print(f"No held-out metric JSONs found under {args.eval_dir}")
         return
+
+    if args.metrics == default_metrics:
+        discovered = sorted({key for row in rows for key in row['metrics']
+                             if re.match(r'^[A-Z0-9_]+_(?:PSNR|SSIM|LPIPS)$', key)})
+        args.metrics += [key for key in discovered if key not in args.metrics]
 
     # --best_checkpoint: collapse each split to its single best validation epoch (reconstructs
     # checkpoint_best.pth) instead of pooling all epochs into the running training-average.
@@ -232,17 +279,30 @@ def main():
     if args.best_checkpoint:
         rows, best_by_split = _select_best_epoch(rows)
 
-    # 2. Determine extrapolation = the largest held-out position within each split.
-    pos_by_split = {}
+    # 2. Label every held-out visit. With leave-one-out a visit is extrapolation when it is the LAST
+    #    visit of its own eye (the largest position that eye was held out at), otherwise
+    #    interpolation, so eyes with fewer visits than the longest one are classified correctly. A
+    #    visit listed at two positions (older runs held out the last visit again when an eye had no
+    #    visit at a position) is kept once, at its first position. Single hold-out records carry no
+    #    position and are extrapolation.
+    seen, eye_last, kept = set(), {}, []
+    for r in sorted(rows, key=lambda r: (r["position"] is None, r["position"] or 0)):
+        keep = []
+        for i, s in enumerate(r["subjects"]):
+            key = (r["split"], r["epoch"], r["position"] is None, s)
+            if key in seen:
+                continue
+            seen.add(key)
+            keep.append(i)
+            if r["position"] is not None:
+                ek = (r["split"], r["epoch"], _eye_of(s))
+                eye_last[ek] = max(eye_last.get(ek, 0), r["position"])
+        kept.append(_subset(r, keep))
+    rows = [r for r in kept if r["subjects"]]
     for r in rows:
-        if r["position"] is not None:
-            pos_by_split.setdefault(r["split"], set()).add(r["position"])
-    last_pos = {s: (max(ps) if ps else None) for s, ps in pos_by_split.items()}
-
-    def kind_of(split, pos):
-        if pos is None:
-            return "extrapolation"      # single hold-out = last visit = extrapolation
-        return "extrapolation" if pos == last_pos.get(split) else "interpolation"
+        r["kinds"] = ["extrapolation" if (r["position"] is None or
+                                          r["position"] == eye_last[(r["split"], r["epoch"], _eye_of(s))])
+                      else "interpolation" for s in r["subjects"]]
 
     # 3. lesion-area MAE + lesion-size MONOTONICITY (held-out), epoch-consistent with the metrics
     #    above. In --best_checkpoint mode we read ONLY the CSV at each split's selected epoch (so every
@@ -304,11 +364,10 @@ def main():
             subs, vals = get(r)
             for sid, v in zip(subs, vals):
                 if v is not None and not (isinstance(v, float) and np.isnan(v)):
-                    eye = re.sub(r"_V\d+$", "", str(sid))
-                    d.setdefault(eye, []).append(float(v))
+                    d.setdefault(_eye_of(sid), []).append(float(v))
         return d
 
-    def summarise(label, split, recs):
+    def summarise(label, split, recs, single_holdout=False):
         # PER-PATIENT aggregation: average each metric WITHIN an eye (over that eye's held-out visits
         # in this bucket), THEN mean +/- se OVER EYES. So n = #eyes (=6 on the test set), and no eye
         # with more held-out visits is over-weighted vs one with fewer.
@@ -317,13 +376,18 @@ def main():
         for m in args.metrics:
             per_eye = [float(np.mean(v)) for v in
                        _by_eye(recs, lambda r, m=m: (r["subjects"], r["metrics"].get(m, []))).values()]
-            mu, se, n = _mean_se(per_eye)
+            mu, se, metric_n = _mean_se(per_eye)
+            n = max(n, metric_n)
             row[f"{m}_mean"], row[f"{m}_se"] = mu, se
         row["n_heldout_visits"] = n          # per-patient aggregation -> this is the eye count (=6)
-        # area-MAE + monotonicity are per-split (trajectory-level): attach to ALL / extrapolation only.
-        if label in ("ALL", "extrapolation"):
+        # area_MAE_mm2 comes from the lesion_areas CSV, which holds only the LAST hold-out round (the
+        # extrapolation round under leave-one-out), so it belongs to the extrapolation row, and to ALL
+        # only when there was a single hold-out. The per-bucket areaMAE_mean below covers every
+        # bucket. Monotonicity is trajectory-level: attach to ALL / extrapolation.
+        if label == "extrapolation" or (label == "ALL" and single_holdout):
             if split in area_mae:
                 row["area_MAE_mm2"] = area_mae[split]
+        if label in ("ALL", "extrapolation"):
             if split in mono:
                 row["mono_decrease_mm2"] = mono[split]
         # Per-BUCKET area-MAE, ALSO per-eye: mean over each eye's held-out |pred-gt| areas, then over eyes.
@@ -336,25 +400,36 @@ def main():
             row["areaMAE_mean"], row["areaMAE_se"] = a_mu, a_se
         return row
 
+    def _pos_label(pos, recs):
+        if pos is None:
+            tags = {r["tag"] for r in recs}
+            tag = tags.pop() if len(tags) == 1 else "single"
+            return f"{'last' if tag in ('holdout_last', 'test', '') else tag} (extrapolation)"
+        kinds = {k for r in recs for k in r["kinds"]}
+        return f"V{pos} ({kinds.pop() if len(kinds) == 1 else 'mixed'})"
+
     for split in sorted({r["split"] for r in rows}):
         srecs = [r for r in rows if r["split"] == split]
-        # per position
+        # per position (records without a position are grouped by their tag, e.g. 'last', 'test_supportk1')
         for pos in sorted({r["position"] for r in srecs}, key=lambda x: (x is None, x)):
             precs = [r for r in srecs if r["position"] == pos]
-            out_rows.append(summarise(f"V{pos} ({kind_of(split, pos)})" if pos else "last (extrapolation)",
-                                      split, precs))
-        # grouped interpolation / extrapolation + overall. Prefer the PER-POSITION records; the
-        # pos=None 'last' record (leave-one-out only) is a redundant pool of ALL held-out visits and
-        # would DOUBLE-COUNT into extrapolation/ALL. Fall back to srecs when there are no per-position
-        # records (e.g. holdout_strategy=last, which only has the single pos=None record).
+            if pos is None:
+                for tag in sorted({r["tag"] for r in precs}):
+                    trecs = [r for r in precs if r["tag"] == tag]
+                    out_rows.append(summarise(_pos_label(None, trecs), split, trecs))
+            else:
+                out_rows.append(summarise(_pos_label(pos, precs), split, precs))
+        # grouped interpolation / extrapolation + overall, from the per-position records when there
+        # are any (leave-one-out), else from the single hold-out records (holdout_strategy last).
         posrecs = [r for r in srecs if r["position"] is not None]
         grouprecs = posrecs if posrecs else srecs
         for kind in ("interpolation", "extrapolation"):
-            krecs = [r for r in grouprecs if kind_of(split, r["position"]) == kind]
+            krecs = [_subset(r, [i for i, k in enumerate(r["kinds"]) if k == kind]) for r in grouprecs]
+            krecs = [r for r in krecs if r["subjects"]]
             if krecs:
                 out_rows.append(summarise(kind, split, krecs))
         # overall
-        out_rows.append(summarise("ALL", split, grouprecs))
+        out_rows.append(summarise("ALL", split, grouprecs, single_holdout=not posrecs))
 
     # 4b. OPT-IN minor/major GA-growth buckets (ImageFlowNet framing). Isolated + fail-soft so it
     # can never break the main interp/extrap summary. growth = 1 - DSC(prev, held-out) from GT masks.
@@ -363,25 +438,19 @@ def main():
             grw = _eye_growth(args.data_csv, args.crop_size, args.score_res)
             for split in sorted({r["split"] for r in rows}):
                 srecs = [r for r in rows if r["split"] == split]
-                # rank each eye's held-out positions chronologically -> index into its growth list
-                eye_positions = {}
-                for r in srecs:
-                    for s in r["subjects"]:
-                        eye_positions.setdefault(s, set()).add(r["position"])
-                eye_rank = {e: {p: i for i, p in enumerate(sorted(ps, key=lambda x: (x is None, x)))}
-                            for e, ps in eye_positions.items()}
+                posrecs = [r for r in srecs if r["position"] is not None]
+                # same record set as the interpolation/extrapolation rows, so no visit counts twice
+                srecs = posrecs if posrecs else srecs
                 # collect per-metric values into minor/major bins
                 bins = {"minor_growth": {m: [] for m in args.metrics},
                         "major_growth": {m: [] for m in args.metrics}}
                 ncount = {"minor_growth": 0, "major_growth": 0}
                 for r in srecs:
-                    subs = r["subjects"]
-                    for i, eye in enumerate(subs):
-                        gl = grw.get(eye)
-                        if not gl:
+                    for i, subject in enumerate(r["subjects"]):
+                        # growth of the held-out visit, looked up by eye and visit number
+                        g = grw.get(_eye_of(subject), {}).get(_visit_of(subject))
+                        if g is None:
                             continue
-                        rank = eye_rank[eye].get(r["position"], 0)
-                        g = gl[rank] if rank < len(gl) else gl[-1]
                         b = "major_growth" if g > args.growth_thr else "minor_growth"
                         ncount[b] += 1
                         for mname in args.metrics:

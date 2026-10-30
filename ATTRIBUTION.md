@@ -1,14 +1,15 @@
 # Attribution
 
 This repository adapts the open-source **CINeMA** framework (Conditional Implicit Neural Multi-Modal
-Atlas) **by Dannecker et al., 2026**, originally developed for spatio-temporal atlases of the perinatal brain. The SIREN-based
+Atlas) by Dannecker et al., developed for spatio-temporal atlases of the perinatal brain. The SIREN-based
 conditional INR decoder, the FiLM latent/condition modulation, the auto-decoder training scheme, and
 the YAML configuration system come from that project and are reused here under its Apache-2.0 licence.
 
-The contribution of our paper is the adaptation of the framework to longitudinal individual
-geographic atrophy prediction from fundus autofluorescence imaging: the 2D retinal data pipeline
-and preprocessing, the FAF-reconstruction and GA-segmentation heads, the eye-specific latent vectors shared across all 
-visits of a single eye, the temporal (weeks-from-baseline) conditioning, the interpolation/extrapolation evaluation on different scenarios.
+The contribution of our paper is the adaptation of the framework to the prediction of individual
+geographic atrophy progression from longitudinal fundus autofluorescence imaging: the 2D retinal data
+pipeline and preprocessing, the FAF-reconstruction and GA-segmentation heads, one latent grid per eye
+shared across all of its visits, the temporal (weeks-from-baseline and age) conditioning, and the
+interpolation/extrapolation evaluation in the forecasting scenarios.
 
 ## Upstream framework
 
@@ -31,7 +32,7 @@ Source: https://github.com/m-dannecker/CINeMA (Apache-2.0).
 
 ## Comparison methods
 
-**Comparison baselines**: the **ImageFlowNet** family, in [`baselines/imageflownet/`](baselines/imageflownet/);
+The comparison baselines, the ImageFlowNet family, are in [`baselines/imageflownet/`](baselines/imageflownet/);
 see [`docs/BASELINES.md`](docs/BASELINES.md). That directory is a lightly adapted copy of the public
 **ImageFlowNet repository by Liu et al., 2025** (https://github.com/KrishnaswamyLab/ImageFlowNet/tree/main), which is
 governed by the Yale Non-Commercial licence, and the I2SB code it vendors by NVIDIA's own

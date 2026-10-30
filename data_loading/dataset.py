@@ -13,8 +13,10 @@ import copy
 
 
 def _seg_path_is_reconstructed(args):
-    """True when the segmentation mask path is rebuilt from Patient_ID/Eye/Visit_ID rather than read
-    from its CSV column -- the condition Data.resolve_path uses to pick the grader-mask branch."""
+    """True when a visit's GA mask can exist even though its CSV `ga_mask_path` is empty. Data.resolve_path
+    always rebuilds the mask path from Patient_ID/Eye/Visit_ID; with 'majority', 'soft' or 'augment'
+    any of mask01/02/03 will do, so an empty `ga_mask_path` (which points at mask01) must not drop
+    the row. With 'single' only mask01 is read, so the column stays a faithful proxy."""
     ds = args['dataset']
     if ds.get('dataset_name') != 'faf_ga':
         return False
@@ -38,11 +40,11 @@ def resolve_split_eyes(args, split, df=None):
         df = pd.read_csv(ds['tsv_file'])
     modcols = [m for m in ds.get('modalities', []) if m in df.columns]
     # Mirror Data.resolve_path: for faf_ga with a grader mode other than 'single', the segmentation
-    # modality (the LAST entry in `modalities`) is reconstructed from Patient_ID/Eye/Visit_ID and its
-    # CSV column is never read. Requiring that column here would drop eyes the loader trains on --
-    # e.g. an eye graded by 02/03 but not 01 has an empty ga_mask_path yet a valid majority mask.
-    if _seg_path_is_reconstructed(args) and modcols:
-        modcols = modcols[:-1]
+    # modality is reconstructed from Patient_ID/Eye/Visit_ID and its CSV column is never read.
+    # Requiring that column here would drop eyes the loader trains on -- e.g. an eye graded by 02/03
+    # but not 01 has an empty ga_mask_path yet a valid majority mask.
+    if _seg_path_is_reconstructed(args):
+        modcols = [key for key in modcols if key != segmentation_modality(args)]
     if modcols:
         df = df.dropna(subset=modcols)
     split_col = ds.get('split_column')
@@ -467,8 +469,8 @@ class Data(Dataset):
               f"(normalize_values={norm_type})...")
         self.patient_stats = {}
         unique_subs = sorted(self.df['sub_id_int'].unique())
-        has_seg = self.args['inr_decoder']['out_dim'][-1] > 0
-        n_mod = len(self.modality_keys) - 1 if has_seg else len(self.modality_keys)
+        recon_keys = reconstruction_modalities(self.args)
+        n_mod = len(recon_keys)
         tkey = self._get_temporal_key()
 
         from tqdm import tqdm
@@ -484,7 +486,7 @@ class Data(Dataset):
                     try:
                         modalities = self.load_modalities(row_dict)
                         for i in range(n_mod):
-                            data = modalities[self.modality_keys[i]].get_fdata()
+                            data = modalities[recon_keys[i]].get_fdata()
                             sub_mins[i] = min(sub_mins[i], data.min())
                             sub_maxs[i] = max(sub_maxs[i], data.max())
                     except Exception as e:
@@ -505,7 +507,7 @@ class Data(Dataset):
                 try:
                     modalities = self.load_modalities(ref_row.to_dict())
                     for i in range(n_mod):
-                        data = modalities[self.modality_keys[i]].get_fdata()
+                        data = modalities[recon_keys[i]].get_fdata()
                         fg = data[data > 0]                # exclude the black registration frame
                         if fg.size == 0:
                             fg = data.ravel()
@@ -602,7 +604,7 @@ class Data(Dataset):
         """
         is_faf_ga = self.args['dataset'].get('dataset_name') == 'faf_ga'
         has_seg = self.args['inr_decoder']['out_dim'][-1] > 0
-        is_seg = has_seg and (mod_key == self.modality_keys[-1])
+        is_seg = has_seg and (mod_key == segmentation_modality(self.args))
 
         if is_faf_ga and is_seg:
             mode = self.args['dataset'].get('mask_grader_mode', 'single')
@@ -700,7 +702,7 @@ class Data(Dataset):
             # Soft consensus target (option B): for the segmentation modality during TRAINING, build a
             # per-pixel mean-of-graders float mask directly (kept in [0,1], never binarised). Val/test
             # don't train segmentation (seg_loss_val: false), so they use the hard majority reference.
-            if (soft_mode and is_faf_ga and has_seg_mod and mod_key == self.modality_keys[-1]
+            if (soft_mode and is_faf_ga and has_seg_mod and mod_key == segmentation_modality(self.args)
                     and self.split == 'train'):
                 soft = self._load_soft_consensus_mask(row_dict)
                 if soft is not None:
@@ -714,14 +716,11 @@ class Data(Dataset):
             # Load the 2D grayscale image (PNG/BMP)
             img = Image.open(path).convert('L') # Grayscale
             
-            # FAF-GA: Resize to world_bbox ONLY if no sampling_bbox is specified.
-            # When sampling_bbox is set, keep original resolution so that
-            # load_coords_and_values can centre-crop exact pixels via
-            # coordinate filtering (no interpolation artifacts).
+            # Resize to world_bbox ONLY if no sampling_bbox is specified. When sampling_bbox is set,
+            # keep original resolution so load_coords_and_values can centre-crop exact pixels without
+            # interpolation artifacts.
             if self.args['dataset'].get('dataset_name') == 'faf_ga':
-                # Mask modality (last key) must resample with NEAREST to stay binary; the FAF
-                # image uses BILINEAR.
-                is_seg_mod = has_seg_mod and (i == len(self.modality_keys) - 1)
+                is_seg_mod = mod_key == segmentation_modality(self.args)
                 resample = Image.Resampling.NEAREST if is_seg_mod else Image.Resampling.BILINEAR
                 crop_pre = self.args['dataset'].get('crop_before_resize')
                 if crop_pre is not None:
@@ -742,7 +741,7 @@ class Data(Dataset):
             
             # Canonicalize laterality (DETERMINISTIC, not augmentation): mirror LEFT (OS) eyes to
             # RIGHT (OD) orientation so the WHOLE dataset shares one orientation. Applied to every
-            # modality (FAF + mask) with the SAME horizontal flip -> they stay aligned; a horizontal
+            # modality with the SAME horizontal flip -> they stay aligned; a horizontal
             # flip commutes with the centre-crop/resize above and leaves ScaleXSlo/area unchanged.
             if self.args['dataset'].get('canonicalize_laterality', False) and self._is_left_eye(row_dict):
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
@@ -764,7 +763,7 @@ class Data(Dataset):
         # Ensure mask values are binary indices [0, 1] for FAF-GA masks (only if seg exists)
         has_seg = self.args['inr_decoder']['out_dim'][-1] > 0  # check if we have segmentation
         if has_seg:
-            mask_key = self.modality_keys[-1]  # segmentation
+            mask_key = segmentation_modality(self.args)  # segmentation
             mask_data = modalities[mask_key].get_fdata()
             if mask_data.max() > len(self.args['dataset'].get('label_names', ['BG'])) - 1:
                 # print(f"Normalizing mask values from {np.unique(mask_data)} to binary [0, 1]")
@@ -775,7 +774,7 @@ class Data(Dataset):
     def load_coords_and_values(self, modalities, row_dict, normalize=True):
         modalities_data = self.augment_modalities(modalities, row_dict)
         # Use last modality for shape reference (works for both seg and no-seg cases)
-        ref_key = self.modality_keys[-1] if self.args['inr_decoder']['out_dim'][-1] > 0 else self.modality_keys[0]
+        ref_key = segmentation_modality(self.args) if self.args['inr_decoder']['out_dim'][-1] > 0 else self.modality_keys[0]
         # ref_key = self.modality_keys[0]
         last_mod = modalities_data[ref_key]
         # affine = modalities[ref_key].affine
@@ -904,67 +903,40 @@ class Data(Dataset):
         if normalize:
             coords = np.clip(coords, -1.0, 1.0)
             assert_correct_coord_normalization(coords)
-            
-            # Apply Normalisation
+
             norm_type = self.args['dataset']['normalize_values']
             sub_id = row_dict['sub_id_int']
-            has_seg = self.args['inr_decoder']['out_dim'][-1] > 0
-            
+            recon_idcs = [self.modality_keys.index(key) for key in reconstruction_modalities(self.args)]
+            has_seg = segmentation_modality(self.args) is not None
+
             if norm_type == 'minmax_patient' and hasattr(self, 'patient_stats'):
-                # Patient-level normalisation (across visits)
                 stats = self.patient_stats[sub_id]
-                if has_seg:
-                    values_mod = values[..., :-1]
-                else:
-                    values_mod = values
+                values_mod = values[..., recon_idcs]
                 v_min = stats['min'].astype(np.float32)
                 v_max = stats['max'].astype(np.float32)
-
-                # Broad-castable subtraction: (N, C) - (C,)
-                denom = v_max - v_min
-                denom = np.where(denom == 0, 1.0, denom).astype(np.float32)
-
-                values_mod = (values_mod - v_min) / denom
-                if has_seg:
-                    values[..., :-1] = values_mod
-                else:
-                    values = values_mod
+                denom = np.where(v_max - v_min == 0, 1.0, v_max - v_min).astype(np.float32)
+                values[..., recon_idcs] = (values_mod - v_min) / denom
             elif norm_type == 'minmax_patient_robust':
-                # OPTION 1, per-VISIT robust percentile scaling on the foreground modality
-                # channels: map this visit's [p1, p99] -> [0, 1] and clip. Excluding the
-                # extremes (the zero frame already isn't sampled; p99 ignores saturated pixels)
-                # removes per-visit exposure/gain mismatch that plain min-max leaves untouched.
-                # Purely per-visit -> needs no patient_stats.
-                values_mod = values[..., :-1] if has_seg else values
+                # Per-visit robust percentile scaling, independently for each reconstruction channel.
+                values_mod = values[..., recon_idcs]
                 p1 = np.percentile(values_mod, 1, axis=0).astype(np.float32)
                 p99 = np.percentile(values_mod, 99, axis=0).astype(np.float32)
                 denom = np.where((p99 - p1) <= 0, 1.0, (p99 - p1)).astype(np.float32)
-                values_mod = np.clip((values_mod - p1) / denom, 0.0, 1.0)
-                if has_seg:
-                    values[..., :-1] = values_mod
-                else:
-                    values = values_mod
+                values[..., recon_idcs] = np.clip((values_mod - p1) / denom, 0.0, 1.0)
             elif norm_type == 'ref_match' and hasattr(self, 'patient_stats'):
-                # OPTION 2, reference-based robust LINEAR matching. Align this visit's foreground
-                # centre+spread (median, IQR) to the eye's BASELINE visit, then squash to [0,1] by
-                # the reference p1/p99. Because every visit is mapped onto the same reference
-                # distribution, inter-visit brightness is genuinely equalized (unlike min-max).
+                # Match every visit to the eye's baseline foreground centre and spread.
                 stats = self.patient_stats[sub_id]
-                values_mod = values[..., :-1] if has_seg else values
+                values_mod = values[..., recon_idcs]
                 m_v = np.median(values_mod, axis=0).astype(np.float32)
                 q25, q75 = np.percentile(values_mod, [25, 75], axis=0)
                 s_v = np.maximum(q75 - q25, 1e-6).astype(np.float32)
                 matched = (values_mod - m_v) / s_v * stats['ref_iqr'] + stats['ref_med']
-                denom = (stats['ref_p99'] - stats['ref_p1'])
+                denom = stats['ref_p99'] - stats['ref_p1']
                 denom = np.where(denom <= 0, 1.0, denom).astype(np.float32)
-                values_mod = np.clip((matched - stats['ref_p1']) / denom, 0.0, 1.0)
-                if has_seg:
-                    values[..., :-1] = values_mod
-                else:
-                    values = values_mod
+                values[..., recon_idcs] = np.clip((matched - stats['ref_p1']) / denom, 0.0, 1.0)
             else:
-                # Default: visit-level normalisation (individual)
-                values = normalize_intensities(values, norm_type, has_seg=has_seg)
+                values = normalize_intensities(values, norm_type, has_seg=has_seg,
+                                               reconstruction_indices=recon_idcs)
         return coords, values
     
     def augment_modalities(self, modalities, row_dict):
@@ -1013,7 +985,7 @@ class Data(Dataset):
                     
                 # 3. Noise (only for intensity modalities, not the segmentation mask)
                 has_seg = self.args['inr_decoder']['out_dim'][-1] > 0
-                is_seg = has_seg and (mod_key == self.modality_keys[-1])
+                is_seg = has_seg and (mod_key == segmentation_modality(self.args))
                 if apply_noise and not is_seg:
                     noise = rng.normal(noise_mean, noise_std, size=data.shape).astype(np.float32)
                     data = data + noise
@@ -1201,15 +1173,19 @@ class Data(Dataset):
         # print(f"Saved mapped dataframe to {out_path}")
 
     def _temporal_sort_col(self):
-        """Column used to order an eye's visits chronologically (first enabled condition,
-        else Visit_Number)."""
+        """Column used to order an eye's visits chronologically: the dataset's temporal_condition
+        (weeks_from_baseline), else the first enabled condition, else Visit_Number. Callers sort
+        with a stable sort, so tied values keep the CSV order."""
+        tkey = self.args['dataset'].get('temporal_condition')
+        if tkey is not None and tkey in self.df.columns:
+            return tkey
         for key, enabled in self.args['dataset'].get('conditions', {}).items():
             if enabled:
                 return key
         return 'Visit_Number' if 'Visit_Number' in self.df.columns else self.df.columns[0]
 
     def get_longitudinal_indices(self, holdout_position=None, single_visit_to='eval', support_k=None,
-                                 pair_source=None, pair_target=None):
+                                 pair_source=None, pair_target=None, missing_position='last'):
         """
         Groups visits by subject and splits them into optimisation and evaluation indices.
 
@@ -1232,6 +1208,11 @@ class Data(Dataset):
                               visits (eval), i.e. "given the first k scans, forecast the rest".
                               support_k=1 = the one-visit clinical forecast (fit on baseline,
                               predict every future visit, scored against GT).
+            missing_position: what to do with an eye that has no visit at `holdout_position`.
+                              'last' holds out its last visit instead (used by the 'specific'
+                              strategy); 'skip' leaves the eye out of the round entirely (used by
+                              leave-one-out, where the last visit already has its own round, so
+                              falling back would score that visit twice, once as interpolation).
 
         Returns:
             opt_pos_idcs:  list of positional indices for latent optimisation.
@@ -1248,7 +1229,7 @@ class Data(Dataset):
             temporal_col = self._temporal_sort_col()
             opt_pos_idcs, eval_pos_idcs = [], []
             for sub_id in self.df['sub_id_int'].unique():
-                sub_sorted = self.df[self.df['sub_id_int'] == sub_id].sort_values(temporal_col)
+                sub_sorted = self.df[self.df['sub_id_int'] == sub_id].sort_values(temporal_col, kind='stable')
                 indices = [self.df.index.get_loc(idx) for idx in sub_sorted.index]
                 if 0 <= s0 < t0 < len(indices):
                     opt_pos_idcs.append(indices[s0])
@@ -1261,7 +1242,7 @@ class Data(Dataset):
             temporal_col = self._temporal_sort_col()
             opt_pos_idcs, eval_pos_idcs = [], []
             for sub_id in self.df['sub_id_int'].unique():
-                sub_sorted = self.df[self.df['sub_id_int'] == sub_id].sort_values(temporal_col)
+                sub_sorted = self.df[self.df['sub_id_int'] == sub_id].sort_values(temporal_col, kind='stable')
                 indices = [self.df.index.get_loc(idx) for idx in sub_sorted.index]
                 opt_pos_idcs.extend(indices[:k])
                 eval_pos_idcs.extend(indices[k:])   # later visits = forecast targets (empty if <=k visits)
@@ -1269,22 +1250,12 @@ class Data(Dataset):
 
         opt_pos_idcs = []
         eval_pos_idcs = []
-        
-        # Resolve temporal column for chronological sorting
-        temp_key = self.args['dataset'].get('conditions', {})
-        temporal_col = None
-        for key, enabled in temp_key.items():
-            if enabled:
-                temporal_col = key
-                break
-        
-        if temporal_col is None:
-            temporal_col = 'Visit_Number' if 'Visit_Number' in self.df.columns else self.df.columns[0]
+        temporal_col = self._temporal_sort_col()
 
         # Group by sub_id_int
         for sub_id in self.df['sub_id_int'].unique():
             sub_group = self.df[self.df['sub_id_int'] == sub_id]
-            sub_group_sorted = sub_group.sort_values(temporal_col)
+            sub_group_sorted = sub_group.sort_values(temporal_col, kind='stable')
             indices = [self.df.index.get_loc(idx) for idx in sub_group_sorted.index]
             
             if len(indices) <= 1:
@@ -1302,6 +1273,8 @@ class Data(Dataset):
             else:
                 ho_idx = holdout_position - 1  # convert 1-indexed to 0-indexed
                 if ho_idx < 0 or ho_idx >= len(indices):
+                    if missing_position == 'skip':
+                        continue
                     # Fallback to last visit if position exceeds available visits
                     ho_idx = len(indices) - 1
 
@@ -1599,7 +1572,11 @@ class Data(Dataset):
         Initialise data augmentation.
         """
         aug_cfg = self.args['data_augmentation']
-        mode = aug_cfg.get('mode', 'pseudo_eye')
-        # Legacy STOCHASTIC per-load augmentation (translation/noise via augment_modalities) is only
-        # used in 'stochastic' mode. 'pseudo_eye' applies deterministic transforms in load_modalities.
+        mode = aug_cfg.get('mode', 'stochastic')
+        # Only the 'stochastic' mode is implemented: per-load translation/noise (augment_modalities),
+        # on the training split only. Fail loudly on any other mode instead of silently training
+        # without augmentation.
+        if aug_cfg.get('activate', False) and mode != 'stochastic':
+            raise ValueError(f"data_augmentation.mode '{mode}' is not implemented; use 'stochastic' "
+                             f"or set data_augmentation.activate: false.")
         self.data_augmentation = bool(aug_cfg.get('activate', False)) and (self.split == 'train') and (mode == 'stochastic')

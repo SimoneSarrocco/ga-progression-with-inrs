@@ -6,6 +6,7 @@ import wandb as wd
 from torch.utils.tensorboard import SummaryWriter
 from build_model import ModelBuilder
 from data_loading.dataset import validate_splits
+from utils import reconstruction_modalities, validate_modality_config
 from download_lakefs_data import download_dataset
 os.environ["WANDB__SERVICE_WAIT"] = "500"
 
@@ -49,6 +50,7 @@ def initial_setup(cmd_args=None):
     if cmd_args is not None:
         args = override_args(args, cmd_args)
 
+    validate_modality_config(args)
     # Guarantee train/val/test are disjoint + leakage-free BEFORE any training starts.
     validate_splits(args)
 
@@ -79,9 +81,8 @@ def initial_setup(cmd_args=None):
         yaml.dump(_yaml_safe(args), f, default_flow_style=False)
     print(f"Saved config files to {args['output_dir']}")
 
-    has_seg = args['inr_decoder']['out_dim'][-1] > 0
-    expected_sr_mods = len(args['dataset']['modalities']) - 1 if has_seg else len(args['dataset']['modalities'])
-    if args['inr_decoder']['out_dim'][0] != expected_sr_mods:
+    expected_sr_mods = len(reconstruction_modalities(args))
+    if sum(args['inr_decoder']['out_dim'][:-1]) != expected_sr_mods:
         print(f"WARNING: The number of output dimensions ({args['inr_decoder']['out_dim'][0]}) " 
               f"might not match the number of intensity modalities ({expected_sr_mods}).")
     if args['logging']: # init weights and biases if logging is True
@@ -125,7 +126,8 @@ def parse_cmd_args():
     parser.add_argument("--model_gen__cond_scale", type=float, help="Scale of the condition vector")
     parser.add_argument("--n_subjects__train", type=int, help="Number of subjects to use for training")
     parser.add_argument("--n_subjects__val", type=int, help="Number of subjects to use for validation")
-    parser.add_argument("--overfit", action="store_true", help="Use the same subjects for training and validation")
+    parser.add_argument("--overfit", action="store_true", default=None,
+                        help="Use the same subjects for training and validation")
     parser.add_argument("--overfit_subject_id", type=str, help="Specific subject ID to overfit on")
     parser.add_argument("--overfit_eye_laterality", type=str, help="Specific eye laterality (OD or OS) to overfit on")
     args = parser.parse_args()

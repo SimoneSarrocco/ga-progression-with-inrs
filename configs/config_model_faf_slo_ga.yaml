@@ -1,0 +1,165 @@
+# Multimodal FAF+SLO+GA model, optimiser and training configuration.
+# Run with: python run.py --config_model configs/config_model_faf_slo_ga.yaml
+
+# --------- Logging ---------
+logging: False
+output_dir: ./runs/faf_slo_ga
+wandb_entity:
+project_name: GAP-INR
+config_data: faf_slo_ga_twovar_wktemporal_512
+
+# --------- Device ---------
+device: cuda
+amp: False
+seed: 1927
+
+# --------- General options ---------
+mask_reconstruction: False
+compute_metrics: True
+overfit: False
+save_imgs:
+  train: False
+  val: True
+  test: False
+save_model: True
+load_model:
+  path: ""
+  epoch: 1
+
+# --------- Data augmentation ---------
+data_augmentation:
+  activate: false
+  # Shared spatial transforms preserve FAF/SLO/GA alignment; noise affects reconstruction images only.
+  mode: 'stochastic'
+  augment_translation:
+    p: 0.3
+    max_shift: 5
+  augment_noise:
+    p: 0.3
+    mean: 0.0
+    std: 0.05
+
+# --------- Optimiser ---------
+optimizer:
+  re_init_latents: False
+  lr_inr: 1.0e-4
+  inr_weight_decay: 0.1
+  lr_latent: 5.0e-3
+  val_latent_init: 'random'
+  latent_weight_decay: 0.1
+  val_latent_reg: 0.01
+  loss_metric: 'mse'
+  seg_weight_zero_prob: 0.0
+  seg_weight: 1.0
+  sr_weight: 10.0           # weight on the aggregate active reconstruction loss
+  seg_dice_weight: 1.0
+  seg_tversky:
+    activate: false
+    alpha: 0.7
+    beta: 0.3
+    weight: 1.0
+  # GA supervision during TTO. The held-out visit remains label-free.
+  seg_loss_val: true
+  # Training always uses FAF+SLO+GA. TTO defaults to FAF+SLO+GA; use ['faf_path'] for FAF+GA.
+  tto_reconstruction_modalities: ['faf_path', 'slo_path']
+  batch_by_eye: false
+  val_early_stopping:
+    activate: true
+    patience: 10
+    min_delta: 0.0
+  scheduler:
+    type: 'cosine'
+    eta_min: 2.5e-5
+
+# --------- INR decoder ---------
+inr_decoder:
+  architecture: "siren"
+  tf_dim: 0
+  cnn_kernel_size: 0
+  latent_dim: [256, 32, 32]
+  in_dim: 2
+  cond_dims: 1              # set from the dataset config
+  cond_encoding: 'raw'
+  cond_num_frequencies: 0
+  cond_mlp_hidden: 16
+  cond_mlp_out: 16
+  cond_mlp_layers: 2
+  time_as_input: false
+  time_encoding: 'raw'
+  time_num_frequencies: 0
+  time_mlp_hidden: 16
+  time_mlp_out: 16
+  time_mlp_layers: 2
+  # FAF + SLO reconstruction channels, followed by background/GA segmentation logits.
+  out_dim: [2, 2]
+  renormalize_output: true
+  seg_threshold: 0.5
+  seg_postprocess:
+    activate: false
+    keep_largest: false
+    min_area_px: 0
+  shared_output_layer: false
+  seg_head_num_layers: 0
+  seg_head_hidden_size: 256
+  seg_head_use_last_features: true
+  seg_branch:
+    activate: false
+    num_layers: 1
+    hidden_size: 512
+    branch_layer: -1
+    modulate: true
+  hidden_size: 384
+  num_hidden_layers: 7
+  modulated_layers: [0, 1, 2, 3, 4, 5, 6, 7]
+  omega_0: 30
+  omega_start: 30
+  omega_end: 30
+  schedule_type: 'constant'
+
+# --------- Coordinate encoding ---------
+encoding:
+  activate: false
+  type: 'none'
+  n_levels: 16
+  n_features_per_level: 8
+  log2_hashmap_size: 19
+  base_resolution: 8
+  finest_resolution: 768
+
+# --------- Sampling grid and extrapolation ---------
+model_gen:
+  spacing: [1.0, 1.0]
+  future_offsets_weeks: [12, 24, 36]
+  cond_scale: 1.0
+
+# --------- Validation ---------
+validation:
+  activate: true
+  train_eval_every: 1
+  log_images_every: 5
+  holdout_strategy: 'last'
+  holdout_visit: null
+
+# --------- Test ---------
+test:
+  activate: true
+
+# --------- Training ---------
+n_subjects:
+  train: 9999
+  val: 9999
+  test: 9999
+epochs:
+  train: 50
+  val: 25
+validate_every: 5
+batch_size: 1
+n_samples: 10000
+num_workers: 16
+
+# --------- Lesion-size analysis ---------
+lesion_analysis:
+  activate: true
+  save_individual_plots: false
+  save_individual_plots_final: true
+  max_individual_plots: 99999

@@ -124,12 +124,18 @@ def _per_eye_holdout(holdout_dir, df, split):
         pred = rec["pred"].copy()
         if os.path.exists(f):
             z = np.load(f)
+            # keys are v<row>_<field>, <row> being the visit's row in the evaluated split, which is
+            # chronological within an eye
             positions = sorted({int(k[1:k.index("_")]) for k in z.files})
             loo = [float(z[f"v{p}_pred_area"]) for p in positions if f"v{p}_pred_area" in z.files]
-            if len(loo) == len(pred):                        # chronological 1:1 with the CSV visits
-                pred = np.asarray(loo)
-            else:
+            gt_loo = [float(z[f"v{p}_gt_area"]) for p in positions if f"v{p}_gt_area" in z.files]
+            if len(loo) != len(pred):
                 print(f"[holdout] {eye}: {len(loo)} LOO preds vs {len(pred)} CSV visits -> keeping CSV preds")
+            elif len(gt_loo) == len(pred) and not np.allclose(gt_loo, rec["gt"], rtol=1e-3, atol=1e-3):
+                print(f"[holdout] {eye}: GT areas in the .npz do not match the CSV visit by visit "
+                      f"-> keeping CSV preds")
+            else:                                            # chronological 1:1 with the CSV visits
+                pred = np.asarray(loo)
         ho = np.zeros(len(pred), bool)
         if len(ho):
             ho[-1] = True                                    # last visit = the forecast target (star)
@@ -255,7 +261,8 @@ def main():
     fig = plt.figure(figsize=(2.9 * ne + 0.3, 4.0))
     gs = GridSpec(1, ne, figure=fig, wspace=0.34, left=0.05, right=0.995, top=0.76, bottom=0.16)
     for k, eye in enumerate(eyes):
-        _panel(fig.add_subplot(gs[0, k]), f"Test eye {k + 1}", per_eye[eye], new.get(eye))   # anonymised
+        _panel(fig.add_subplot(gs[0, k]), f"{args.split.capitalize()} eye {k + 1}", per_eye[eye],
+               new.get(eye))   # anonymised
 
     fig.supxlabel("weeks from baseline", fontsize=11, color=C_GT)
     fig.supylabel("GA area  [mm$^2$]", fontsize=11, color=C_GT)

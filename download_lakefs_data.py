@@ -5,7 +5,8 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-from data_loading.lakefs_config import make_loader, check_connection, LakeFSConfigError
+from data_loading.lakefs_config import (make_loader, check_connection, read_credentials,
+                                        LakeFSConfigError)
 
 # We need the path resolution logic
 def extract_faf_ga_path(row_dict, mod_key):
@@ -140,11 +141,14 @@ def download_dataset(dataset_key, config_path='./configs/config_data.yaml',
         
     print(f"Need to download {len(to_download)} files. Starting with {num_workers} parallel workers...")
     
-    endpoint = cfg.get('lakefs_endpoint', cfg.get('s3_endpoint'))
-    access_key = cfg.get('lakefs_access_key', cfg.get('access_key'))
-    secret_key = cfg.get('lakefs_secret_key', cfg.get('secret_key'))
-    ca_path = cfg.get('ca_path', cfg.get('ca_bundle'))
-    
+    # Same credentials make_loader resolved above (file or GAPINR_LAKEFS_* variables).
+    creds, _ = read_credentials(ds_config['lakefs'])
+    endpoint = creds['endpoint']
+    access_key = creds['access_key']
+    secret_key = creds['secret_key']
+    ca_path = creds['ca_bundle']
+    repo = lakefs_loader.repo_name
+
     def _download_task(args):
         import boto3
         obj_key, local_path = args
@@ -163,13 +167,19 @@ def download_dataset(dataset_key, config_path='./configs/config_data.yaml',
                 s3_client = boto3.client('s3')
                 
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            # Download to a temporary name first, so an interrupted transfer never leaves a
+            # truncated file that later runs would treat as cached.
+            tmp_path = local_path + ".tmp"
             s3_client.download_file(
-                Bucket=lakefs_config['repo'],
+                Bucket=repo,
                 Key=obj_key,
-                Filename=local_path
+                Filename=tmp_path
             )
+            os.replace(tmp_path, local_path)
             return True, obj_key
         except Exception as e:
+            if os.path.exists(local_path + ".tmp"):
+                os.remove(local_path + ".tmp")
             return False, f"{obj_key}: {e}"
 
     success_count = 0

@@ -15,7 +15,7 @@ all of its visits; visits are told apart by a temporal conditioning variable (we
 ## 1. The metadata CSV (`tsv_file`)
 
 A single comma-separated table, **one row per patient-eye visit**, pointed to by
-`configs/config_data.yaml → tsv_file` (default `./data/clinical_metadata.csv`). The loader reads:
+`tsv_file` in `configs/config_data.yaml` (default `./data/clinical_metadata.csv`). The loader reads:
 
 | Column | Required | Type | Meaning / how to construct |
 |---|---|---|---|
@@ -23,18 +23,35 @@ A single comma-separated table, **one row per patient-eye visit**, pointed to by
 | `split` | **yes** | str | `train` / `val` / `test` (`split_column`). Defines the partition (section 6). Build with `preprocessing/add_split_column.py` (patient-wise). |
 | `Patient_ID` | **yes** | str | Patient identifier; used to build image/mask paths and group eyes. |
 | `Eye` | **yes** | str | `OD` / `OS`; used for path reconstruction and laterality. |
-| `Visit_ID` | **yes** | str/int | Visit id, e.g. `V01`, or an integer `1` (auto-formatted to `V0x`). Orders visits and builds paths. |
-| `Visit_Number` | if using `visit_week_map` | int | Ordinal visit index (1,2,3,…). Only needed for the fixed-schedule time option (section 3-C). |
+| `Visit_ID` | **yes** | str/int | Visit id, e.g. `V01`, or an integer `1` (formatted to `V01`). Used to build the mask paths. |
+| `Visit_Number` | **yes** | int | Ordinal visit index (1, 2, 3, …). Names the held-out visit in the metric files (`EYE07_OD_V3`), which `summarise_eval.py` parses to group visits by eye; also used by the fixed-schedule time option and to fill undated visits (section 3). |
 | `faf_path` | **yes** | str | Location of the FAF image (section 5). |
-| `ga_mask_path` | **yes** | str | Location of the GA mask (section 5). |
+| `slo_path` | multimodal only | str | Location of the registered SLO image. Required by `faf_slo_ga_*` sections; local and lakeFS resolution use `Spectralis_slo`. |
+| `ga_mask_path` | recommended | str | Path of the grader-1 mask (`…_mask01.png`). The loader finds masks through the fixed layout of section 5, not through this column, but with `mask_grader_mode: single` the split guard drops rows where it is empty, and the growth buckets of `summarise_eval.py` and the baselines read it. |
 | `visit_date` / `Visit_date` | recommended | number or date | Per-visit date; numeric = Excel serial day, else a parseable date. Source for `weeks_from_baseline` (section 3-A). |
 | `diff` | alt. to date | number | Elapsed **days** from the eye's baseline visit (section 3-B). |
-| `AgeatVisit` | optional | float | Age (years) at the visit; usable as the time axis (`temporal_condition: AgeatVisit`). |
-| `ScaleXSlo`, `ScaleYSlo` | recommended | float | Physical pixel size (mm/pixel), to convert GA pixels → mm². Default `1.0` if absent. |
+| `AgeatVisit` | **yes** (shipped config) | float | Age (years) at the visit. A FiLM condition in the shipped config, so rows without it are dropped. It can also serve as the time axis (`temporal_condition: AgeatVisit`). |
+| `ScaleXSlo`, `ScaleYSlo` | recommended | float | Physical pixel size (mm/pixel), to convert GA pixel counts to mm². Default `1.0` if absent. |
 | `lesion_size`, … | optional | float | Any extra numeric column can be enabled as a conditioning/constraint variable (section 2). |
 
 > Eye IDs in `configs/expected_split.yaml` are anonymized placeholders (`EYE01_OD …`). Replace that
 > file (and the CSV) with your own IDs, or regenerate the split (section 6).
+
+`modalities` defines the ordered target columns; `modality_roles` defines how each column is used:
+
+```yaml
+modalities: ['faf_path', 'slo_path', 'ga_mask_path']
+modality_roles:
+  faf_path: reconstruction
+  slo_path: reconstruction
+  ga_mask_path: segmentation
+primary_reconstruction_modality: faf_path
+```
+
+Every listed modality is required: a visit is dropped if any file is missing. Multimodal images must be
+registered to the same field of view before loading; the loader applies shared crop/resize/flip and
+coordinate sampling but does not perform cross-modal registration. Old checkpoints without
+`modality_roles` retain the legacy reconstruction-plus-final-mask interpretation.
 
 ---
 
@@ -46,22 +63,25 @@ dataset section of `configs/config_data.yaml`:
 ```yaml
 faf_ga:
   conditions:
-    AgeatVisit: false          # available, but not a FiLM condition here
-    weeks_from_baseline: true  # -> FiLM conditioning vector
-    lesion_size: false
+    AgeatVisit: true           # FiLM condition
+    weeks_from_baseline: true  # FiLM condition
   temporal_condition: weeks_from_baseline   # which variable is the time axis
-  constraints:                              # valid ranges; out-of-range rows dropped, values clamped
+  constraints:                              # [min, max] per variable
     weeks_from_baseline: {type: numeric, min: 0.0, max: 54.143}
     AgeatVisit:          {type: numeric, min: 66.0, max: 91.0}
 ```
 
-- `conditions: <name>: true` → the variable is fed to the decoder as a **FiLM conditioning vector**.
-- `temporal_condition` names the **time axis** (advanced at inference to forecast future visits).
-- `constraints` give the `[min, max]` used to normalise each variable to `[-1, 1]`; rows out of range
-  or `NaN` are dropped, in-range values are clamped unless `extrapolate_beyond_range: true`.
+This is the shipped configuration: both variables are FiLM conditions.
 
-Every extra covariate must (a) be a CSV column and (b) be listed under both `conditions` and
-`constraints`.
+- `conditions: <name>: true` feeds the variable to the decoder as a FiLM condition.
+- `temporal_condition` names the time axis: the variable that orders an eye's visits (which one is
+  held out as "last") and that is moved to render other time points.
+- `constraints` give the `[min, max]` used to normalise each variable to `[-1, 1]`. Rows whose value
+  is outside the range, or missing, are dropped when the data is loaded. When a visit at a new time
+  point is rendered, values past the range are clamped to it unless `extrapolate_beyond_range: true`
+  (the shipped setting).
+
+Every extra covariate must be a CSV column and be listed under both `conditions` and `constraints`.
 
 ---
 
@@ -69,23 +89,25 @@ Every extra covariate must (a) be a CSV column and (b) be listed under both `con
 
 Computed automatically at load time (`_add_weeks_from_baseline_col`) from the first available of:
 
-- **A, dates (recommended):** `visit_date`/`Visit_date`. Numeric values are Excel serial **days**; anything else is parsed
-  as a date. `weeks = (date − eye's earliest date) / 7`.
+- **A, dates (recommended):** `visit_date`/`Visit_date`. Numeric values are Excel serial **days**;
+  anything else is parsed as a date. `weeks = (date - eye's earliest date) / 7`.
 - **B, elapsed days:** a `diff` column (days from baseline). `weeks = diff / 7`.
-- **C, fixed schedule:** if neither of the above is present, `visit_week_map` in `config_data.yaml` maps
-  `Visit_Number` → weeks, e.g. `{1: 0, 2: 12, 3: 24, 4: 48}`.
+- **C, fixed schedule:** if neither of the above is present, `visit_week_map` in `config_data.yaml`
+  maps `Visit_Number` to weeks, e.g. `{1: 0, 2: 12, 3: 24, 4: 48}`.
 
-With `weeks_constraint_from_dates: true`, the normalisation `[min, max]` is taken from the actual
-date-derived global range. You never pre-compute `weeks_from_baseline`. Just provide A, B, or C.
+With A or B, visits without a date get their week from `visit_week_map` (or 0 if the map has no
+entry), so they are not dropped. With `weeks_constraint_from_dates: true` (shipped), the normalisation
+`[min, max]` is the range of `weeks_from_baseline` over the whole CSV, all splits included; the value
+in the YAML is then ignored. `weeks_from_baseline` is never read from the CSV.
 
 ---
 
 ## 4. Laterality
 
-`canonicalize_laterality: true` mirrors **left (OS)** eyes to the right (OD) orientation so the whole
-cohort shares one orientation (a horizontal flip applied identically to image and mask; it commutes
-with the crop/resize and leaves pixel areas unchanged). Left eyes are detected from the `Eye_ID`
-suffix (`…_OS`) or the `Eye`/`Laterality` column.
+`canonicalize_laterality: true` in the dataset section mirrors left (OS) eyes to the right (OD)
+orientation, with the same horizontal flip for image and mask. Pixel areas are unchanged. Left eyes are
+detected from the `Eye_ID` suffix (`…_OS`) or the `Eye`/`Laterality` column. It is off in the shipped
+configuration (the key is absent).
 
 ---
 
@@ -95,8 +117,8 @@ suffix (`…_OS`) or the `Eye`/`Laterality` column.
 
 ### 5.1 The canonical `data/` tree
 
-For every visit, GA **grader masks** are addressed by this fixed layout (this supports the study's
-multi-grader consensus):
+For every visit, the GA grader masks are found through this fixed layout, built from `Patient_ID`,
+`Eye` and `Visit_ID`:
 
 ```
 data/<Patient_ID>/<Eye>/<Vxx>/Spectralis_faf/<Patient_ID>_<Eye>_<Vxx>_mask01.png
@@ -109,10 +131,11 @@ data/<Patient_ID>/<Eye>/<Vxx>/Spectralis_faf/<Patient_ID>_<Eye>_<Vxx>_mask03.png
 | Mode | Behaviour |
 |---|---|
 | `single` | use `…_mask01.png` only (**use this if you have one mask per visit**) |
-| `majority` (paper default) | per-pixel majority vote of `mask01/02/03`; cached as `…_majority.png` |
+| `majority` (paper default) | per-pixel vote over the available `mask01/02/03`: GA where at least half of them mark GA (so with two graders, either one); written next to them as `…_majority.png` and reused on later runs |
 | `soft` | per-pixel mean of graders (soft training target; evaluation uses the majority vote) |
 
-Masks are grayscale PNGs; a pixel is "GA" where intensity > 127.
+Masks are grayscale PNGs. The majority vote counts a grader pixel as GA above 127; the mask the model
+reads is then binarised at > 0.
 
 The **FAF image** is taken from the `faf_path` CSV column (any 2-D grayscale `.png`/`.bmp`). Keep it
 in the same tree for tidiness:
@@ -136,10 +159,10 @@ tree is:
 ```
 
 Concretely, set in the CSV: `faf_path = ./cache/faf_ga/main/data/<Patient_ID>/<Eye>/<Vxx>/Spectralis_faf/<Patient_ID>_<Eye>_<Vxx>_FAF.png`
-(absolute paths also work: if `faf_path` is an existing absolute path it is used verbatim). The FAF
-image may live anywhere as long as `faf_path` points to it; **only the masks are bound to the
-`cache_path/branch/data/…` layout above.** To put everything under a single custom root, just change
-`cache_path` accordingly (e.g. `cache_path: /data/my_cohort` → masks under
+(an existing absolute path is used as is; a relative path is resolved from the repository root,
+where the commands run). The FAF image may live anywhere as long as `faf_path` points to it; only the
+masks are bound to the `cache_path/branch/data/…` layout above. To keep everything under another
+root, change `cache_path` (e.g. `cache_path: /data/my_cohort` puts the masks under
 `/data/my_cohort/main/data/…`).
 
 ### 5.3 lakeFS setup (remote store)
@@ -194,7 +217,7 @@ required: set none of them to read from local disk, and setting only some is rep
 straight away rather than as an obscure S3 failure later.
 
 lakeFS object keys mirror the local tree: `data/<Patient_ID>/<Eye>/<Vxx>/Spectralis_faf/<file>`, and
-downloads land at `<cache_path>/<branch>/data/…`, exactly where the local-disk path in section 5.2
+downloads land at `<cache_path>/<branch>/data/…`, where the local-disk path in section 5.2
 looks. So a cache filled over lakeFS keeps working when you later run with no credentials.
 
 ---
@@ -202,15 +225,14 @@ looks. So a cache filled over lakeFS keeps working when you later run with no cr
 ## 6. Train / validation / test split
 
 The split is the `split` column of the CSV. `configs/subject_ids.yaml` keeps the `faf_ga` lists
-**empty on purpose** so the loader reads the CSV column; this guarantees GAP-INR and the baselines
-share exactly one split. Eyes with fewer than `min_valid_visits_eval` (2) usable visits are dropped
-from val/test (leave-one-out needs ≥2 visits).
+empty, so the loader reads the CSV column, which the baselines read as well. Eyes with fewer than
+`min_valid_visits_eval` (2) usable visits are dropped from val/test (leave-one-out needs at least
+two).
 
 `preprocessing/add_split_column.py` writes a patient-wise split (both eyes of a patient in the same
-split; default 70/15/15, seed 42). The canonical partition is frozen in `configs/expected_split.yaml`
-(25 train / 5 val / 6 test eyes in the paper), and `validate_splits()` **aborts every run** if the
-resolved partition differs or train/val/test overlap. This guards against silent drift and leakage.
-Update or regenerate `expected_split.yaml` for your own cohort.
+split; default 70/15/15, seed 42). The paper's partition is frozen in `configs/expected_split.yaml`
+(26 train / 5 val / 6 test eyes), and `validate_splits()` aborts every run if the resolved partition
+differs from it or if train/val/test overlap. Replace `expected_split.yaml` for your own cohort.
 
 ---
 
@@ -222,34 +244,35 @@ lakeFS is an **optional** remote-store convenience, off by default:
   and reads every file from local disk (section 5.2). This is the default. Only the `.example`
   template ships.
 - To use a remote store, follow section 5.3.
-- You may also delete the `lakefs:` block entirely for a purely local run (masks then resolve under
-  `./cache/faf_ga/main/data/…` by default).
+- You can also delete the `lakefs:` block; masks then resolve under `./cache/faf_ga/main/data/…`.
 
 Credentials are never committed (`lakefs_cfg.yaml` is git-ignored).
 
 ---
 
-## 8. Preprocessing chain (raw → model input)
+## 8. Preprocessing chain (raw image to model input)
 
 Performed in `data_loading/dataset.py`:
 
-1. **Load** FAF and mask as 2-D grayscale (`PIL`).
-2. **Center-crop → resize:** crop native (e.g. 768 → **620**, `crop_before_resize`) to drop the black
-   registration frame while keeping all GA, then resize to `world_bbox` (**512** here): FAF bilinear,
-   mask nearest. A crop (not a plain resize), so physical scale is preserved.
-3. **Binarize** the mask to `{0, 1}`.
-4. **Coordinate sampling** (`sampling_strategy: all`): every pixel → a coordinate normalised to `[-1, 1]`.
-5. **Intensity normalisation** (`normalize_values: minmax`, paper default): each visit's FAF → `[0, 1]`.
-6. **Conditioning:** `weeks_from_baseline` (and enabled covariates) attached per visit, normalised to
-   `[-1, 1]` via the `constraints` ranges.
+1. **Load** configured reconstruction images and GA mask as 2-D grayscale (`PIL`).
+2. **Centre-crop, then resize:** crop the native image (768 px) to `crop_before_resize` (620 px),
+   which removes the black registration frame and keeps all GA, then resize to `world_bbox` (512 px):
+   FAF/SLO bilinear, mask nearest. The resize changes the pixel size; the area conversion below corrects
+   for it.
+3. **Binarise** the mask to `{0, 1}`.
+4. **Coordinate sampling** (`sampling_strategy: all`): every pixel becomes a coordinate in `[-1, 1]`.
+5. **Intensity normalisation** (`normalize_values: minmax`, paper default): each visit's FAF and,
+   when configured, SLO are independently min-max scaled to `[0, 1]`.
+6. **Conditioning:** `weeks_from_baseline` and `AgeatVisit` are attached per visit, normalised to
+   `[-1, 1]` with the `constraints` ranges.
 
 Lesion area (metrics/figures) is `#GA pixels × ScaleXSlo × ScaleYSlo × rf` mm², identical for
 prediction and the identically-cropped ground truth. `ScaleXSlo`/`ScaleYSlo` are mm per pixel at
 *native* resolution, so `rf = (crop_before_resize / world_bbox)²` converts them to the scoring grid:
 resizing the 620 crop to 512 makes each grid pixel cover `(620/512)² ≈ 1.47` native pixels of area.
 `rf = 1` for sections that crop at native pitch instead of resizing. `build_model.py`'s
-`_lesion_px_area_mm2` is the single source of truth, and the ImageFlowNet baselines apply the same
-factor, so areas are comparable across methods.
+`_lesion_px_area_mm2` computes it for every area GAP-INR reports, and the ImageFlowNet baselines
+apply the same factor for their grid.
 
 ---
 
@@ -268,9 +291,9 @@ reference material to adapt, not a chain to run in order, and they overwrite
 ## 10. Checklist for your own cohort
 
 1. Build `data/clinical_metadata.csv` with the columns in section 1 (one row per eye-visit).
-2. Provide `visit_date` **or** `diff` **or** `Visit_Number` + `visit_week_map` for the time axis (section 3).
-3. Lay out FAF images and grader mask(s) per section 5 (section 5.2 local, or section 5.3 lakeFS); pick `mask_grader_mode`
-   (`single` if one mask/visit).
+2. Provide `visit_date`, `diff`, or `Visit_Number` + `visit_week_map` for the time axis (section 3).
+3. Lay out FAF images and grader masks per section 5 (5.2 local, 5.3 lakeFS) and pick
+   `mask_grader_mode` (`single` for one mask per visit).
 4. Add the `split` column and regenerate `configs/expected_split.yaml` for your eye IDs (section 6).
 5. Point `tsv_file` at your CSV; adjust `crop_before_resize`/`world_bbox` to your image size if needed.
 6. Run `python run.py` (see the main [README](../README.md)).

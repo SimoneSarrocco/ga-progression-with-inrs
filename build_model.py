@@ -162,9 +162,11 @@ class ModelBuilder:
         return is_val_epoch and (n_val % every == 0)
 
     def _load_best_decoder(self):
-        """Load decoder weights from 'checkpoint_best.pth' into inr_decoder['train'] so the test
-        pass uses the best (by val-eval DICE) checkpoint. Falls back to the current in-memory
-        weights if the file is missing (e.g. save_model: false or no validation ran)."""
+        """Load decoder weights (and the matching training latents) from 'checkpoint_best.pth' into
+        the 'train' split so the test pass uses the best (by val-eval DICE) checkpoint. The latents
+        matter for val_latent_init 'population_mean' / 'nearest_train', which read them. Falls back to
+        the current in-memory weights if the file is missing (e.g. save_model: false, or evaluate.py,
+        which already loaded the requested checkpoint)."""
         best_path = os.path.join(self.args['output_dir'], 'checkpoint_best.pth')
         if not os.path.exists(best_path):
             print(f"[test] No checkpoint_best.pth at {best_path}; using current decoder weights "
@@ -173,6 +175,7 @@ class ModelBuilder:
         chkp = torch.load(best_path, weights_only=False)
         self.inr_decoder['train'].load_state_dict(chkp['inr_decoder'])
         self.inr_decoder['train'].eval()
+        self.latents['train'].data.copy_(chkp['latents'].to(self.latents['train'].device))
         print(f"[test] Loaded best decoder weights from epoch {chkp.get('epoch')} ({best_path}).")
 
     def test(self):
@@ -231,7 +234,8 @@ class ModelBuilder:
                 print(f"\n{'='*60}\n  TEST Leave-One-Out: holding out visit {ho_pos}/{max_visits}\n{'='*60}")
                 d = self._run_validation_round(
                     epoch_tag, tb_writer, grid_coords, grid_shape, picked_test_subs,
-                    holdout_position=ho_pos, tag_suffix=f"holdout_V{ho_pos}", split='test')
+                    holdout_position=ho_pos, tag_suffix=f"holdout_V{ho_pos}", split='test',
+                    missing_position='skip')
                 if d is not None:
                     dices.append(d)
                 if getattr(self, '_last_round_eval_metrics', None):
@@ -344,13 +348,18 @@ class ModelBuilder:
                     src = src_recs[0] if src_recs else {}
                     pa, ga = tgt.get('pred_area'), tgt.get('gt_area')
                     growth = self._mask_change(src.get('gt_seg'), tgt.get('gt_seg'))
-                    rows.append(dict(
+                    row = dict(
                         Patient_Eye=sub_id, src_visit=s, tgt_visit=t,
                         Dice=tgt.get('dice'), PSNR=tgt.get('psnr'), SSIM=tgt.get('ssim'),
                         LPIPS=tgt.get('lpips'), HD=tgt.get('hd'),
                         area_MAE_mm2=(abs(pa - ga) if (pa is not None and ga is not None) else float('nan')),
                         growth=growth, is_major=(growth is not None and growth > 0.1),
-                        is_extrap=(t == int(n_visits.get(sub_id, t)))))
+                        is_extrap=(t == int(n_visits.get(sub_id, t))))
+                    for mod in reconstruction_modalities(self.args):
+                        for metric in ('PSNR', 'SSIM', 'LPIPS'):
+                            key = f'{modality_metric_prefix(mod)}_{metric}'
+                            row[key] = tgt.get('modality_metrics', {}).get(mod, {}).get(metric)
+                    rows.append(row)
 
         if not rows:
             print("[pairwise] no eligible pairs (eyes need >= 2 visits).")
@@ -386,6 +395,10 @@ class ModelBuilder:
         # metric key in the rows -> column prefix in the summary
         metric_cols = [('Dice', 'DICE'), ('PSNR', 'PSNR'), ('SSIM', 'SSIM'),
                        ('LPIPS', 'LPIPS'), ('HD', 'HD'), ('area_MAE_mm2', 'areaMAE')]
+        for mod in reconstruction_modalities(self.args):
+            for metric in ('PSNR', 'SSIM', 'LPIPS'):
+                key = f'{modality_metric_prefix(mod)}_{metric}'
+                metric_cols.append((key, key))
         summ = []
         for name, pred in buckets:
             sub = [r for r in rows if pred(r)]
@@ -468,6 +481,12 @@ class ModelBuilder:
         return np.mean(loss_hist_batches), epoch_avg_loss
 
 
+    def _reconstruction_modalities_for_loss(self, split):
+        configured = reconstruction_modalities(self.args)
+        if split == 'train':
+            return configured
+        return self.args['optimizer'].get('tto_reconstruction_modalities') or configured
+
     def train_batch(self, batch, epoch, split='train', epoch_train=None, sub_writer=None):
         tb_writer = self.args.get('tb_writer', None)
         loss_hist_samples = []
@@ -512,8 +531,9 @@ class ModelBuilder:
                 values_p = self.inr_decoder[split](coords, self.latents[split], conditions,
                                                    idcs_df=idx_df,
                                                    time_vals=time_vals)
-                loss = self.loss_criterion(values_p, values,
-                                           seg_weight=seg_weight)
+                loss = self.loss_criterion(
+                    values_p, values, seg_weight=seg_weight,
+                    active_reconstruction_modalities=self._reconstruction_modalities_for_loss(split))
 
             # Anchored latent regularisation during TTA (val/test). The latent is fit on the
             # reconstruction loss only, which is heavily under-determined; this L2 term keeps it
@@ -688,7 +708,8 @@ class ModelBuilder:
                     tag_suffix = f"holdout_V{ho_pos}"
                     d = self._run_validation_round(
                         epoch_train, tb_writer, grid_coords, grid_shape,
-                        picked_val_subs, holdout_position=ho_pos, tag_suffix=tag_suffix
+                        picked_val_subs, holdout_position=ho_pos, tag_suffix=tag_suffix,
+                        missing_position='skip'
                     )  # d is the round's mean held-out DICE
                     if d is not None:
                         val_eval_dices.append(d)
@@ -1177,15 +1198,9 @@ class ModelBuilder:
 
     def log_publication_reconstruction_figure(self, epoch, split, subject_ids, opt_idcs, eval_idcs, subject_data=None, tag_suffix=''):
         """
-        Generates two "publication-ready" figures per patient-eye:
-        1. FAF combined timeline:
-           - Row 1: FAF GT (blank for interpolated/extrapolated)
-           - Row 2: FAF Prediction (with border style highlighting the status and PSNR)
-           - Row 3: FAF Intra-visit Signed Difference Map
-        2. Segmentation combined timeline:
-           - Row 1: Segmentation GT (blank for interpolated/extrapolated)
-           - Row 2: Segmentation Prediction (with border style highlighting the status and Dice)
-           - Row 3: Segmentation TP/FP/FN Intra-visit Change Map
+        Generates one publication-ready timeline per reconstruction modality, plus a
+        segmentation timeline. Observed visits include GT and modality-specific metrics;
+        interpolated/extrapolated visits contain predictions only.
         """
         print(f"\n--- Generating Publication-Ready Figures for {split} split ---")
         from PIL import Image
@@ -1197,7 +1212,10 @@ class ModelBuilder:
         grid_coords, grid_shape = generate_world_grid(self.args, device=self.device)
         df = self.datasets[split].df
         id_col = self.args['dataset'].get('id_column', 'subject_id')
-        modalities = self.args['dataset']['modalities']
+        recon_modalities = reconstruction_modalities(self.args)
+        recon_channels = reconstruction_channel_map(self.args)
+        seg_modality = segmentation_modality(self.args)
+        primary_modality = primary_reconstruction_modality(self.args)
         
         # Colour theme: orange for train, blue for val
         color = '#FFA726' if split == 'train' else '#29B6F6'
@@ -1267,70 +1285,88 @@ class ModelBuilder:
                     recon_border = 'none'
 
                 # Load GT modalities and reconstruct predictions
-                gt_loaded_ok = False
-                pred_loaded_ok = False
+                recon_dict = {}
+                gt_recon = {}
+                pred_recon = {}
+                gt_seg = None
+                pred_seg = None
 
                 if subject_data is not None and sub_id in subject_data and pos in subject_data[sub_id]['reconstructions']:
                     recon_dict = subject_data[sub_id]['reconstructions'][pos]
-                    gt_faf = recon_dict['gt_faf']
-                    pred_faf = recon_dict['pred_faf']
-                    gt_seg = recon_dict['gt_seg']
-                    pred_seg = recon_dict['pred_seg']
-                    gt_loaded_ok = gt_faf is not None
-                    pred_loaded_ok = pred_faf is not None
-                
+                    cached_images = recon_dict.get('reconstruction_images', {})
+                    for mod in recon_modalities:
+                        mod_imgs = cached_images.get(mod)
+                        if mod_imgs is not None:
+                            gt_recon[mod] = mod_imgs.get('ref')
+                            pred_recon[mod] = mod_imgs.get('pred')
+                        elif mod == primary_modality:
+                            gt_recon[mod] = recon_dict.get('gt_faf')
+                            pred_recon[mod] = recon_dict.get('pred_faf')
+                    gt_seg = recon_dict.get('gt_seg')
+                    pred_seg = recon_dict.get('pred_seg')
+
+                gt_loaded_ok = all(gt_recon.get(mod) is not None for mod in recon_modalities) and gt_seg is not None
+                pred_loaded_ok = all(pred_recon.get(mod) is not None for mod in recon_modalities) and pred_seg is not None
                 if not (gt_loaded_ok and pred_loaded_ok):
                     # Fallback: Load GT modalities on the fly
                     try:
-                        faf_path = self.datasets[split].resolve_path(row_dict, modalities[0])
-                        gt_faf = load_2d_modality(faf_path, is_seg=False, patient_stats=patient_stats, args=self.args)
+                        for mod in recon_modalities:
+                            mod_path = self.datasets[split].resolve_path(row_dict, mod)
+                            gt_recon[mod] = load_2d_modality(
+                                mod_path, is_seg=False, patient_stats=patient_stats,
+                                mod_index=recon_channels[mod], args=self.args)
 
-                        seg_path = self.datasets[split].resolve_path(row_dict, modalities[1])
+                        seg_path = self.datasets[split].resolve_path(row_dict, seg_modality)
                         gt_seg = load_2d_modality(seg_path, is_seg=True, patient_stats=patient_stats, args=self.args)
-                        gt_loaded_ok = True
                     except Exception as e:
                         print(f"Warning: Failed to load GT modalities for {eye_id} at week {weeks}: {e}")
                         continue
-                    
+
                     # Fallback: Reconstruct visit on the fly (independent_visits uses the positional
                     # per-visit latent slot, matching _evaluate_visits).
                     latent_idx = pos if self.args['dataset'].get('independent_visits', False) else int(sub_id)
                     try:
                         volume_inf = self._reconstruct_visit(row_dict, latent_idx, grid_coords, grid_shape, split=split)
-                        pred_np = typecheck_img(volume_inf)
-                        
-                        pred_faf = pred_np[..., 0].astype(np.float32)
-                        pred_seg = pred_np[..., 1].astype(np.float32)
-                        pred_loaded_ok = True
+                        pred_images = self._extract_modality_images(volume_inf)
+                        pred_recon = {mod: pred_images[mod] for mod in recon_modalities}
+                        pred_seg = pred_images[seg_modality]
                     except Exception as e:
                         print(f"Warning: Failed to reconstruct visit for {eye_id} at week {weeks}: {e}")
                         continue
-                
-                # Crop/align dimensions
-                if gt_faf.shape != pred_faf.shape:
-                    H_ref, W_ref = gt_faf.shape
-                    H_pred, W_pred = pred_faf.shape
-                    h_start = max(0, (H_ref - H_pred) // 2)
-                    w_start = max(0, (W_ref - W_pred) // 2)
-                    gt_faf = gt_faf[h_start:h_start + H_pred, w_start:w_start + W_pred]
-                    gt_seg = gt_seg[h_start:h_start + H_pred, w_start:w_start + W_pred]
-                
+
+                def _crop_gt_to_pred(gt, pred):
+                    if gt.shape == pred.shape:
+                        return gt
+                    h_start = max(0, (gt.shape[0] - pred.shape[0]) // 2)
+                    w_start = max(0, (gt.shape[1] - pred.shape[1]) // 2)
+                    return gt[h_start:h_start + pred.shape[0], w_start:w_start + pred.shape[1]]
+
+                for mod in recon_modalities:
+                    gt_recon[mod] = _crop_gt_to_pred(gt_recon[mod], pred_recon[mod])
+                gt_seg = _crop_gt_to_pred(gt_seg, pred_seg)
+
                 # Metrics & lesion sizes: reuse the values cached during evaluation if present
                 # (single source of truth, no recompute); otherwise compute them here.
-                rd = recon_dict if (subject_data is not None and sub_id in subject_data
-                                    and pos in subject_data[sub_id]['reconstructions']) else {}
-                psnr = rd.get('psnr')
-                if psnr is None:
-                    psnr = psnr_metric(pred_faf, gt_faf, data_range=1.0)
-                ssim = rd.get('ssim')
-                if ssim is None:
-                    ssim = ssim_metric(pred_faf, gt_faf, data_range=1.0)
+                rd = recon_dict
+                recon_metrics = {}
+                diff_recon = {}
+                for mod in recon_modalities:
+                    cached_metrics = rd.get('modality_metrics', {}).get(mod, {})
+                    psnr = cached_metrics.get('PSNR')
+                    ssim = cached_metrics.get('SSIM')
+                    if mod == primary_modality:
+                        psnr = psnr if psnr is not None else rd.get('psnr')
+                        ssim = ssim if ssim is not None else rd.get('ssim')
+                    if psnr is None:
+                        psnr = psnr_metric(pred_recon[mod], gt_recon[mod], data_range=1.0)
+                    if ssim is None:
+                        ssim = ssim_metric(pred_recon[mod], gt_recon[mod], data_range=1.0)
+                    recon_metrics[mod] = {'PSNR': psnr, 'SSIM': ssim}
+                    diff_recon[mod] = _signed_diff_map(pred_recon[mod], gt_recon[mod])
+
                 dice = rd.get('dice')
                 if dice is None:
                     dice = compute_dice(pred_seg, gt_seg, bg_label)
-
-                # Difference & TP/FP/FN maps
-                diff_faf = _signed_diff_map(pred_faf, gt_faf)
                 diff_seg = _seg_tpfpfn_map(pred_seg, gt_seg)
 
                 _px_mm2 = self._lesion_px_area_mm2(row_dict)
@@ -1343,14 +1379,13 @@ class ModelBuilder:
 
                 actual_visits.append({
                     'week': weeks,
-                    'gt_faf': gt_faf,
-                    'pred_faf': pred_faf,
-                    'diff_faf': diff_faf,
+                    'gt_recon': gt_recon,
+                    'pred_recon': pred_recon,
+                    'diff_recon': diff_recon,
+                    'recon_metrics': recon_metrics,
                     'gt_seg': gt_seg,
                     'pred_seg': pred_seg,
                     'diff_seg': diff_seg,
-                    'psnr': psnr,
-                    'ssim': ssim,
                     'dice': dice,
                     'gt_border': gt_border,
                     'recon_border': recon_border,
@@ -1381,27 +1416,29 @@ class ModelBuilder:
                     if pred_imgs is None:
                         continue
                     
-                    pred_faf = pred_imgs[modalities[0]]
-                    pred_seg = pred_imgs[modalities[1]] if len(modalities) > 1 else None
-                        
-                    blank_faf = np.zeros_like(pred_faf)
-                    blank_seg = np.zeros_like(pred_seg) if pred_seg is not None else np.zeros_like(pred_faf)
-                    blank_diff_faf = np.zeros((*pred_faf.shape, 3), dtype=np.float32)
+                    pred_recon = {mod: pred_imgs[mod] for mod in recon_modalities}
+                    pred_seg = pred_imgs[seg_modality]
+                    gt_recon = {mod: np.zeros_like(pred_recon[mod]) for mod in recon_modalities}
+                    diff_recon = {
+                        mod: np.zeros((*pred_recon[mod].shape, 3), dtype=np.float32)
+                        for mod in recon_modalities
+                    }
+                    blank_seg = np.zeros_like(pred_seg)
                     blank_diff_seg = np.zeros((*blank_seg.shape, 3), dtype=np.float32)
-                    
-                    pred_area = (np.sum(pred_seg > 0.5) * self._lesion_px_area_mm2(new_row)
-                                 if pred_seg is not None else 0.0)
+
+                    pred_area = np.sum(pred_seg > 0.5) * self._lesion_px_area_mm2(new_row)
 
                     interpolated_visits.append({
                         'week': w,
-                        'gt_faf': blank_faf,
-                        'pred_faf': pred_faf,
-                        'diff_faf': blank_diff_faf,
+                        'gt_recon': gt_recon,
+                        'pred_recon': pred_recon,
+                        'diff_recon': diff_recon,
+                        'recon_metrics': {
+                            mod: {'PSNR': None, 'SSIM': None} for mod in recon_modalities
+                        },
                         'gt_seg': blank_seg,
-                        'pred_seg': pred_seg if pred_seg is not None else blank_seg,
+                        'pred_seg': pred_seg,
                         'diff_seg': blank_diff_seg,
-                        'psnr': None,
-                        'ssim': None,
                         'dice': None,
                         'gt_border': 'none',
                         'recon_border': 'solid',
@@ -1424,27 +1461,29 @@ class ModelBuilder:
                     if pred_imgs is None:
                         continue
                     
-                    pred_faf = pred_imgs[modalities[0]]
-                    pred_seg = pred_imgs[modalities[1]] if len(modalities) > 1 else None
-                        
-                    blank_faf = np.zeros_like(pred_faf)
-                    blank_seg = np.zeros_like(pred_seg) if pred_seg is not None else np.zeros_like(pred_faf)
-                    blank_diff_faf = np.zeros((*pred_faf.shape, 3), dtype=np.float32)
+                    pred_recon = {mod: pred_imgs[mod] for mod in recon_modalities}
+                    pred_seg = pred_imgs[seg_modality]
+                    gt_recon = {mod: np.zeros_like(pred_recon[mod]) for mod in recon_modalities}
+                    diff_recon = {
+                        mod: np.zeros((*pred_recon[mod].shape, 3), dtype=np.float32)
+                        for mod in recon_modalities
+                    }
+                    blank_seg = np.zeros_like(pred_seg)
                     blank_diff_seg = np.zeros((*blank_seg.shape, 3), dtype=np.float32)
-                    
-                    pred_area = (np.sum(pred_seg > 0.5) * self._lesion_px_area_mm2(new_row)
-                                 if pred_seg is not None else 0.0)
+
+                    pred_area = np.sum(pred_seg > 0.5) * self._lesion_px_area_mm2(new_row)
 
                     extrapolated_visits.append({
                         'week': w,
-                        'gt_faf': blank_faf,
-                        'pred_faf': pred_faf,
-                        'diff_faf': blank_diff_faf,
+                        'gt_recon': gt_recon,
+                        'pred_recon': pred_recon,
+                        'diff_recon': diff_recon,
+                        'recon_metrics': {
+                            mod: {'PSNR': None, 'SSIM': None} for mod in recon_modalities
+                        },
                         'gt_seg': blank_seg,
-                        'pred_seg': pred_seg if pred_seg is not None else blank_seg,
+                        'pred_seg': pred_seg,
                         'diff_seg': blank_diff_seg,
-                        'psnr': None,
-                        'ssim': None,
                         'dice': None,
                         'gt_border': 'none',
                         'recon_border': 'dashed',
@@ -1483,68 +1522,67 @@ class ModelBuilder:
                           "interpolated = teal   |   extrapolated = purple"
                           % ('orange' if split == 'train' else 'blue'))
 
-            # --- 1. Plot FAF combined timeline figure ---
-            fig_faf, axes_faf = plt.subplots(3, K, figsize=(3.5 * K, 9), squeeze=False)
-            fig_faf.patch.set_facecolor('white')
-            fig_faf.suptitle(f"FAF Timeline: {eye_id} (Split: {split}) - Epoch {epoch}", color='black', fontsize=16, fontweight='bold', y=0.96)
-            
-            for col_idx, v in enumerate(combined_visits):
-                v_color = status_color.get(v['status'], color)
-                # Row 1: GT FAF
-                ax = axes_faf[0, col_idx]
-                ax.imshow(v['gt_faf'], cmap='gray', vmin=0, vmax=1)
-                ax.set_facecolor('white')
-                ax.set_xticks([])
-                ax.set_yticks([])
-                set_axis_border(ax, v['gt_border'], v_color)
-                ax.set_title(v['label'], color=v_color, fontsize=12, fontweight='semibold')
-                # GT lesion size (GA pixels x SLO spacing), same value shown on the seg figure.
-                if v['gt_area'] is not None:
-                    ax.set_xlabel(f"GT Size: {v['gt_area']:.2f} mm²", color=v_color, fontsize=10, fontweight='semibold')
-                else:
-                    ax.set_xlabel("GT Size: N/A", color=v_color, fontsize=10, fontweight='semibold')
+            # One combined timeline per reconstruction modality.
+            for mod in recon_modalities:
+                mod_label = modality_metric_prefix(mod)
+                mod_key = mod_label.lower()
+                fig_recon, axes_recon = plt.subplots(3, K, figsize=(3.5 * K, 9), squeeze=False)
+                fig_recon.patch.set_facecolor('white')
+                fig_recon.suptitle(f"{mod_label} Timeline: {eye_id} (Split: {split}) - Epoch {epoch}", color='black', fontsize=16, fontweight='bold', y=0.96)
 
-                # Row 2: Pred FAF
-                ax = axes_faf[1, col_idx]
-                ax.imshow(v['pred_faf'], cmap='gray', vmin=0, vmax=1)
-                ax.set_facecolor('white')
-                ax.set_xticks([])
-                ax.set_yticks([])
-                set_axis_border(ax, status_style.get(v['status'], 'solid'), v_color)
-                # Predicted lesion size always shown; append PSNR/SSIM when available.
-                size_txt = f"\nPred Size: {v['pred_area']:.2f} mm²" if v.get('pred_area') is not None else ""
-                if v['psnr'] is not None:
-                    ssim_txt = f" | SSIM {v['ssim']:.3f}" if v.get('ssim') is not None else ""
-                    ax.set_xlabel(f"PSNR {v['psnr']:.1f} dB{ssim_txt}{size_txt}", color=v_color, fontsize=10, fontweight='semibold')
-                else:
-                    ax.set_xlabel(f"({v['status'].capitalize()}){size_txt}", color=v_color, fontsize=10, fontweight='semibold')
+                for col_idx, v in enumerate(combined_visits):
+                    v_color = status_color.get(v['status'], color)
+                    ax = axes_recon[0, col_idx]
+                    ax.imshow(v['gt_recon'][mod], cmap='gray', vmin=0, vmax=1)
+                    ax.set_facecolor('white')
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    set_axis_border(ax, v['gt_border'], v_color)
+                    ax.set_title(v['label'], color=v_color, fontsize=12, fontweight='semibold')
+                    if v['gt_area'] is not None:
+                        ax.set_xlabel(f"GT Size: {v['gt_area']:.2f} mm²", color=v_color, fontsize=10, fontweight='semibold')
+                    else:
+                        ax.set_xlabel("GT Size: N/A", color=v_color, fontsize=10, fontweight='semibold')
 
-                # Row 3: Difference Map
-                ax = axes_faf[2, col_idx]
-                ax.imshow(v['diff_faf'])
-                ax.set_facecolor('white')
-                ax.set_xticks([])
-                ax.set_yticks([])
-                set_axis_border(ax, 'none', v_color)
+                    ax = axes_recon[1, col_idx]
+                    ax.imshow(v['pred_recon'][mod], cmap='gray', vmin=0, vmax=1)
+                    ax.set_facecolor('white')
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    set_axis_border(ax, status_style.get(v['status'], 'solid'), v_color)
+                    size_txt = f"\nPred Size: {v['pred_area']:.2f} mm²" if v.get('pred_area') is not None else ""
+                    psnr = v['recon_metrics'][mod]['PSNR']
+                    ssim = v['recon_metrics'][mod]['SSIM']
+                    if psnr is not None:
+                        ssim_txt = f" | SSIM {ssim:.3f}" if ssim is not None else ""
+                        ax.set_xlabel(f"PSNR {psnr:.1f} dB{ssim_txt}{size_txt}", color=v_color, fontsize=10, fontweight='semibold')
+                    else:
+                        ax.set_xlabel(f"({v['status'].capitalize()}){size_txt}", color=v_color, fontsize=10, fontweight='semibold')
 
-                if col_idx == 0:
-                    axes_faf[0, col_idx].set_ylabel("FAF GT", color='black', fontsize=12, fontweight='bold')
-                    axes_faf[1, col_idx].set_ylabel("FAF Pred", color='black', fontsize=12, fontweight='bold')
-                    axes_faf[2, col_idx].set_ylabel("FAF Diff", color='black', fontsize=12, fontweight='bold')
+                    ax = axes_recon[2, col_idx]
+                    ax.imshow(v['diff_recon'][mod])
+                    ax.set_facecolor('white')
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    set_axis_border(ax, 'none', v_color)
 
-            fig_faf.text(0.5, 0.02, legend_txt, color='black', fontsize=10, ha='center', style='italic')
-            plt.tight_layout(rect=[0.05, 0.05, 0.95, 0.93])
-            try:
-                filepath_faf = os.path.join(pub_dir, f"subject_{eye_id}_faf{sfx}_epoch_{epoch}.png")
-                plt.savefig(filepath_faf, dpi=150, bbox_inches='tight', facecolor='white')
-                # Log to TensorBoard
-                if tb_writer is not None:
-                    fig_faf.canvas.draw()
-                    rgba = fig_faf.canvas.buffer_rgba()
-                    img_arr = np.asarray(rgba)[..., :3]
-                    tb_writer.add_image(f"{split}/publication_figures/{eye_id}/faf{sfx}", img_arr, global_step=epoch, dataformats='HWC')
-            finally:
-                plt.close(fig_faf)
+                    if col_idx == 0:
+                        axes_recon[0, col_idx].set_ylabel(f"{mod_label} GT", color='black', fontsize=12, fontweight='bold')
+                        axes_recon[1, col_idx].set_ylabel(f"{mod_label} Pred", color='black', fontsize=12, fontweight='bold')
+                        axes_recon[2, col_idx].set_ylabel(f"{mod_label} Diff", color='black', fontsize=12, fontweight='bold')
+
+                fig_recon.text(0.5, 0.02, legend_txt, color='black', fontsize=10, ha='center', style='italic')
+                plt.tight_layout(rect=[0.05, 0.05, 0.95, 0.93])
+                try:
+                    filepath_recon = os.path.join(pub_dir, f"subject_{eye_id}_{mod_key}{sfx}_epoch_{epoch}.png")
+                    fig_recon.savefig(filepath_recon, dpi=150, bbox_inches='tight', facecolor='white')
+                    if tb_writer is not None:
+                        fig_recon.canvas.draw()
+                        rgba = fig_recon.canvas.buffer_rgba()
+                        img_arr = np.asarray(rgba)[..., :3]
+                        tb_writer.add_image(f"{split}/publication_figures/{eye_id}/{mod_key}{sfx}", img_arr, global_step=epoch, dataformats='HWC')
+                finally:
+                    plt.close(fig_recon)
             
             # --- 2. Plot Segmentation combined timeline figure ---
             fig_seg, axes_seg = plt.subplots(3, K, figsize=(3.5 * K, 9), squeeze=False)
@@ -1605,7 +1643,7 @@ class ModelBuilder:
             finally:
                 plt.close(fig_seg)
             
-        print(f"Decoupled FAF and Segmentation timeline figures generated for {split} split in reconstructions/publication_figures/")
+        print(f"Reconstruction and segmentation timeline figures generated for {split} split in reconstructions/publication_figures/")
 
         # Export the new-timepoint predicted areas in the plot_lesion_size_trajectories.py --new-csv
         # schema (Patient_Eye, Weeks, Pred_Area_mm2, Kind). Empty for the per-visit-latent model
@@ -1625,7 +1663,8 @@ class ModelBuilder:
 
     def _run_validation_round(self, epoch_train, tb_writer, grid_coords, grid_shape,
                               picked_val_subs, holdout_position=None, tag_suffix='holdout_last',
-                              split='val', support_k=None, pair_source=None, pair_target=None):
+                              split='val', support_k=None, pair_source=None, pair_target=None,
+                              missing_position='last'):
         """
         Run a single test-time-optimisation round on `split` ('val' or 'test'): re-init latents,
         optimise on non-held-out visits, evaluate on both optimisation and held-out visits.
@@ -1635,6 +1674,8 @@ class ModelBuilder:
             tag_suffix:       string appended to TensorBoard/metric tags (e.g. 'holdout_V2').
             split:            'val' (default) or 'test'. For 'test', single-visit patient-eyes
                               are optimised on (not held out), mirroring clinical deployment.
+            missing_position: 'skip' leaves out eyes with no visit at holdout_position
+                              (leave-one-out); 'last' holds out their last visit instead.
 
         Returns:
             Mean DICE over the held-out (eval) visits for this round, or None if there are no
@@ -1666,14 +1707,22 @@ class ModelBuilder:
         single_visit_to = 'opt' if split == 'test' else 'eval'
         opt_idcs, eval_idcs = self.datasets[split].get_longitudinal_indices(
             holdout_position=holdout_position, single_visit_to=single_visit_to, support_k=support_k,
-            pair_source=pair_source, pair_target=pair_target)
+            pair_source=pair_source, pair_target=pair_target, missing_position=missing_position)
+        # Eyes taking part in this round (leave-one-out skips eyes with no visit at this position).
+        _round_df = self.datasets[split].df.iloc[list(opt_idcs) + list(eval_idcs)]
+        picked_val_subs = [s for s in picked_val_subs if s in set(_round_df['sub_id_int'])]
         self.current_val_opt_idcs = opt_idcs
         self.current_val_eval_idcs = eval_idcs
         # Per-visit held-out metrics of THIS round (set below); consumed by the leave_one_out loop
         # to build the averaged-across-positions table. None if there are no held-out visits.
         self._last_round_eval_metrics = None
 
-        ho_label = "none" if holdout_position == 'none' else (f"visit {holdout_position}" if holdout_position else "last visit")
+        if pair_source is not None and pair_target is not None:
+            ho_label = f"visit {pair_target}, fitted on visit {pair_source} only"
+        elif support_k is not None:
+            ho_label = f"every visit after the first {int(support_k)}"
+        else:
+            ho_label = "none" if holdout_position == 'none' else (f"visit {holdout_position}" if holdout_position else "last visit")
         print(f"[{split} {tag_suffix}] Optimising on {len(opt_idcs)} visits, evaluating on {len(eval_idcs)} (held-out: {ho_label})")
 
         # 1. Optimise latents on non-held-out visits
@@ -1834,7 +1883,9 @@ class ModelBuilder:
                     time_vals = time_b[s:s + n_smpls]
                     values_p = self.inr_decoder[split](coords, self.latents[split], conditions,
                                                        idcs_df=idx_df, time_vals=time_vals)
-                    loss = self.loss_criterion(values_p, values, seg_weight=seg_weight)
+                    loss = self.loss_criterion(
+                        values_p, values, seg_weight=seg_weight,
+                        active_reconstruction_modalities=self._reconstruction_modalities_for_loss(split))
                     for k, v in loss.items():
                         accum.setdefault(k, []).append(v.item() if hasattr(v, 'item') else v)
         return {k: float(np.mean(vals)) for k, vals in accum.items()} if accum else None
@@ -1916,8 +1967,8 @@ class ModelBuilder:
 
                 # Per-visit scalars computed ONCE and reused by every figure (single source of truth)
                 modalities = self.args['dataset']['modalities']
-                pred_seg = res_imgs[modalities[1]].get('pred') if len(modalities) > 1 else None
-                gt_seg = res_imgs[modalities[1]].get('ref') if len(modalities) > 1 else None
+                pred_seg = res_imgs[segmentation_modality(self.args)].get('pred') if len(modalities) > 1 else None
+                gt_seg = res_imgs[segmentation_modality(self.args)].get('ref') if len(modalities) > 1 else None
 
                 # Lesion sizes in mm^2 = (#GA pixels on the sampling grid) * ScaleXSlo * ScaleYSlo * rf.
                 # ScaleXSlo/ScaleYSlo are mm/px at NATIVE resolution. faf_ga_620 samples the native-pitch
@@ -1946,6 +1997,13 @@ class ModelBuilder:
                 v_dice = _first(res_metrics.get('DICE'))
                 v_hd = _first(res_metrics.get('HD'))
                 v_lpips = _first(res_metrics.get('LPIPS'))
+                modality_metrics = {
+                    mod: {
+                        metric: _first(res_metrics.get(f'{modality_metric_prefix(mod)}_{metric}'))
+                        for metric in ('PSNR', 'SSIM', 'LPIPS')
+                    }
+                    for mod in reconstruction_modalities(self.args)
+                }
 
 
                 # For each modality, appends this visit's predicted image, GT image, intra-visit diff map,
@@ -1969,8 +2027,9 @@ class ModelBuilder:
                     subject_data[sub_id_int]['mods'][mod]['preds'].append(imgs.get('pred'))
                     subject_data[sub_id_int]['mods'][mod]['refs'].append(imgs.get('ref'))
                     subject_data[sub_id_int]['mods'][mod]['diff_intra'].append(imgs.get('diff_intra'))
-                    subject_data[sub_id_int]['mods'][mod]['psnr'].append(v_psnr)
-                    subject_data[sub_id_int]['mods'][mod]['ssim'].append(v_ssim)
+                    mod_metrics = modality_metrics.get(mod, {})
+                    subject_data[sub_id_int]['mods'][mod]['psnr'].append(mod_metrics.get('PSNR'))
+                    subject_data[sub_id_int]['mods'][mod]['ssim'].append(mod_metrics.get('SSIM'))
                     subject_data[sub_id_int]['mods'][mod]['dice'].append(v_dice)
                     subject_data[sub_id_int]['mods'][mod]['pred_area'].append(pred_area)
                     subject_data[sub_id_int]['mods'][mod]['gt_area'].append(gt_area)
@@ -1992,6 +2051,13 @@ class ModelBuilder:
                 subject_data[sub_id_int]['reconstructions'][visit_idx] = {
                     'pred_faf': res_imgs[modalities[0]].get('pred'),
                     'gt_faf': res_imgs[modalities[0]].get('ref'),
+                    'reconstruction_images': {
+                        mod: {
+                            'pred': res_imgs[mod].get('pred'),
+                            'ref': res_imgs[mod].get('ref'),
+                        }
+                        for mod in reconstruction_modalities(self.args)
+                    },
                     'pred_seg': pred_seg,
                     'gt_seg': gt_seg,
                     'pred_area': pred_area,
@@ -2003,6 +2069,7 @@ class ModelBuilder:
                     'dice': v_dice,
                     'hd': v_hd,
                     'lpips': v_lpips,
+                    'modality_metrics': modality_metrics,
                 }
 
             elif self.args['save_imgs'][split]:
@@ -2099,7 +2166,7 @@ class ModelBuilder:
             for mod, content in data['mods'].items():
                 if not content['preds']:
                     continue
-                is_seg_mod = has_seg and (mod == modalities[-1])
+                is_seg_mod = has_seg and mod == segmentation_modality(self.args)
 
                 # FAF / Seg Tiled (Pred vs Ref) --> predicted visit vs GT visit
                 fig = make_longitudinal_tiled_figure(
@@ -2148,7 +2215,7 @@ class ModelBuilder:
                         filepath_gt_diff = os.path.join(tiled_dir, f"subject_{eye_id}_{mod}_GT_Baseline_Differences_epoch_{epoch}.png")
                         fig_gt_diff.savefig(filepath_gt_diff, dpi=150, bbox_inches='tight')
                         # Log to TensorBoard: row1 = Pred follow-up vs GT baseline, row2 = GT follow-up
-                        # vs GT baseline, per modality (FAF + seg). Replaces the former
+                        # vs GT baseline, per reconstruction/segmentation modality. Replaces the former
                         # Future/Interpolation "Differences" images.
                         if tb_writer is not None:
                             tag_gt_diff = f"{split}/{eye_id}/{mod}/GT_Baseline_Differences_{tensorboard_tag}"
@@ -2163,14 +2230,14 @@ class ModelBuilder:
         img_dict = {}
         # Get one of the decoders to retrieve sr_dims
         decoder = self.inr_decoder['train'] if 'train' in self.inr_decoder else self.inr_decoder['val']
-        for i, mod in enumerate(modalities):
-            is_seg = has_seg and (i == len(modalities) - 1)
+        recon_channels = reconstruction_channel_map(self.args)
+        seg_modality = segmentation_modality(self.args)
+        for mod in modalities:
+            is_seg = has_seg and mod == seg_modality
             if is_seg:
-                sr_dims = decoder.sr_dims
-                n_seg_classes = pred.shape[-1] - sr_dims - 1
-                pred_data = pred[..., sr_dims].astype(np.float32)
+                pred_data = pred[..., decoder.sr_dims].astype(np.float32)
             else:
-                pred_data = pred[..., i].astype(np.float32)
+                pred_data = pred[..., recon_channels[mod]].astype(np.float32)
             img_dict[mod] = pred_data
         return img_dict
 
@@ -2241,12 +2308,13 @@ class ModelBuilder:
                         opt_dice_vals.extend(res_metrics['DICE'])
 
                     modalities = self.args['dataset']['modalities']
-                    for m_name in ['PSNR', 'SSIM', 'DICE']:
-                        if m_name in res_metrics:
-                            m_list = res_metrics[m_name]
-                            for i, mod in enumerate(modalities):
-                                if i < len(m_list):
-                                    metrics_accum[category][mod][m_name].append(m_list[i])
+                    seg_modality = segmentation_modality(self.args)
+                    for mod in modalities:
+                        metric_names = ['DICE'] if mod == seg_modality else ['PSNR', 'SSIM']
+                        for m_name in metric_names:
+                            metric_key = (m_name if mod == seg_modality
+                                          else f'{modality_metric_prefix(mod)}_{m_name}')
+                            metrics_accum[category][mod][m_name].extend(res_metrics.get(metric_key, []))
 
                     # For picked subjects, also log convergence images patient-eye-wise
                     if tb_writer is not None and sub_id in picked_subs:
@@ -2380,6 +2448,8 @@ class ModelBuilder:
         id_col = self.args['dataset'].get('id_column', 'subject_id')  
         sampling_bbox = self.args['dataset'].get('sampling_bbox')
         visit_week_map = self.args['dataset'].get('visit_week_map')
+        recon_channels = reconstruction_channel_map(self.args)
+        seg_modality = segmentation_modality(self.args)
 
         if visit_week_map is not None:
             def get_weeks_for_visit(v_num):
@@ -2422,10 +2492,12 @@ class ModelBuilder:
                     week = float(row_dict.get(self._temporal_key, 0.0))
 
                 gt_imgs = {}
-                for mod_i, mod in enumerate(self.args['dataset']['modalities']):
+                for mod in self.args['dataset']['modalities']:
                     mod_path = self.datasets[split].resolve_path(row_dict, mod)
-                    is_seg = 'seg' in mod.lower() or 'mask' in mod.lower()
-                    img = load_2d_modality(mod_path, is_seg, patient_stats=patient_stats, mod_index=mod_i, args=self.args)
+                    is_seg = mod == seg_modality
+                    img = load_2d_modality(
+                        mod_path, is_seg, patient_stats=patient_stats,
+                        mod_index=recon_channels.get(mod, 0), args=self.args)
                     img = center_crop_2d(img, sampling_bbox)
                     gt_imgs[mod] = img
 
@@ -2484,7 +2556,7 @@ class ModelBuilder:
             # Per-eye pixel->mm^2 scale (≈constant across visits) for the lesion-size captions below.
             # Single source of truth (_lesion_px_area_mm2) -> captions agree with the CSV/metrics/figures.
             has_seg = self.args['inr_decoder']['out_dim'][-1] > 0
-            seg_key = self.args['dataset']['modalities'][-1] if has_seg else None
+            seg_key = seg_modality if has_seg else None
             px_area = self._lesion_px_area_mm2(gt_visits[0]['row_dict']) if gt_visits else 1.0
 
             # 4. For each modality, build and log figures
@@ -2546,7 +2618,7 @@ class ModelBuilder:
                 # baseline-diff of the synthetic interpolated/extrapolated visits) are no longer logged.
                 # These novel visits have no ground truth, so a GT-vs-prediction difference is not
                 # meaningful here. The GT-baseline difference comparison (Pred follow-up vs GT baseline
-                # and GT follow-up vs GT baseline, FAF + seg) is logged instead from
+                # and GT follow-up vs GT baseline, for every modality) is logged instead from
                 # _log_reconstruction_figures, where real GT visits are available.
 
 
@@ -2578,7 +2650,10 @@ class ModelBuilder:
             print(f'Not saving model state as save_model is set to False')
 
     def load_checkpoint(self, chkp_path=None, epoch=None):
-        chkp_path = os.path.join(chkp_path, f'checkpoint_epoch_{epoch}.pth')
+        """Load a checkpoint. `chkp_path` is either the .pth file itself or a run directory, in which
+        case checkpoint_epoch_{epoch}.pth inside it is loaded."""
+        if not os.path.isfile(chkp_path):
+            chkp_path = os.path.join(chkp_path, f'checkpoint_epoch_{epoch}.pth')
         if not os.path.exists(chkp_path):
             raise FileNotFoundError(f'State file {chkp_path} not found!')
         chkp = torch.load(chkp_path, weights_only=False)

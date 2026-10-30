@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# GAP-INR end-to-end pipeline: TRAIN -> EVAL (val+test LOO) -> DIAGNOSTICS.
+# GAP-INR end-to-end pipeline: TRAIN -> EVAL (val+test LOO) -> TRAJECTORY FIGURE.
 #
-# One command runs the whole thing on an automatically-picked free GPU and
-# writes every log under the run directory so you can monitor it in one place.
+# Runs the three stages on the GPU with the most free memory (or --gpu N) and
+# writes the eval and figure logs under the run directory.
 #
 #   ./run_pipeline.sh                         # full pipeline, auto GPU, default config
 #   ./run_pipeline.sh --gpu 3                 # force a specific GPU
@@ -101,7 +101,11 @@ if has_stage traj; then
   echo; echo "================ STAGE: TRAJECTORIES ================"
   CSV=$(ls -1v "$RUN_DIR"/evaluation_*/lesion_analysis/lesion_areas_test_epoch_*.csv 2>/dev/null | tail -1 || true)
   if [[ -n "$CSV" ]]; then
-    $PY plot_lesion_size_trajectories.py --csv "$CSV" --split test 2>&1 | tee "$RUN_DIR/traj.log"
+    # Paper version: every observed visit is plotted as its leave-one-out prediction.
+    EVAL_DIR="$(dirname "$(dirname "$CSV")")"
+    TRAJ_ARGS=(--csv "$CSV" --split test)
+    [[ -d "$EVAL_DIR/holdout_timeline_arrays" ]] && TRAJ_ARGS+=(--holdout-dir "$EVAL_DIR/holdout_timeline_arrays")
+    $PY plot_lesion_size_trajectories.py "${TRAJ_ARGS[@]}" 2>&1 | tee "$RUN_DIR/traj.log"
   else
     echo "  (no test lesion_areas CSV found yet; run the eval stage first)"
   fi
@@ -112,5 +116,5 @@ echo "================ PIPELINE DONE ================"
 echo "Run dir : $RUN_DIR"
 echo "Monitor : tensorboard --logdir $RUN_DIR/tb_logs"
 echo "Key outputs:"
-echo "  - eval summary : $RUN_DIR/evaluation_*/leave_one_out_summary.csv  (interp vs extrap DICE/IoU/areaMAE)"
+echo "  - eval summary : $RUN_DIR/evaluation_*/leave_one_out_summary.csv  (interpolation vs extrapolation)"
 echo "  - trajectories : $RUN_DIR/evaluation_*/lesion_analysis/lesion_size_trajectories.png"

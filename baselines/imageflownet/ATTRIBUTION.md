@@ -6,7 +6,7 @@ on the longitudinal FAF / geographic-atrophy cohort. The model implementations, 
 upstream work; see "What was changed" below for the parts added for this paper.
 
 ImageFlowNet: Forecasting Multiscale Image-Level Trajectories of Disease Progression with
-Irregularly-Sampled Longitudinal Medical Images — Chen Liu, Ke Xu, Liangbo L. Shen, Guillaume
+Irregularly-Sampled Longitudinal Medical Images. Chen Liu, Ke Xu, Liangbo L. Shen, Guillaume
 Huguet, Zilong Wang, Alexander Tong, Danilo Bzdok, Jay Stewart, Jay C. Wang, Lucian V. Del Priore,
 Smita Krishnaswamy. https://github.com/ChenLiu-1996/ImageFlowNet
 
@@ -14,9 +14,9 @@ Smita Krishnaswamy. https://github.com/ChenLiu-1996/ImageFlowNet
 
 | Path | License | Terms |
 |---|---|---|
-| this directory | Non-Commercial License, Yale University © 2024 — [`LICENSE.md`](LICENSE.md) | non-commercial use only |
-| `external_src/I2SB/` | NVIDIA Source Code License for I2SB — [`external_src/I2SB/LICENSE`](external_src/I2SB/LICENSE) | non-commercial use only |
-| `external_src/I2SB/guided_diffusion/` | MIT © 2021 OpenAI — [`LICENSE_GUIDED_DIFFUSION`](external_src/I2SB/guided_diffusion/LICENSE_GUIDED_DIFFUSION) | permissive |
+| this directory | Non-Commercial License, Yale University © 2024 ([`LICENSE.md`](LICENSE.md)) | non-commercial use only |
+| `external_src/I2SB/` | NVIDIA Source Code License for I2SB ([`external_src/I2SB/LICENSE`](external_src/I2SB/LICENSE)) | non-commercial use only |
+| `external_src/I2SB/guided_diffusion/` | MIT © 2021 OpenAI ([`LICENSE_GUIDED_DIFFUSION`](external_src/I2SB/guided_diffusion/LICENSE_GUIDED_DIFFUSION)) | permissive |
 
 The rest of the GAP-INR repository is Apache-2.0. That license does **not** extend to this directory;
 see the "Scope of this license" note at the end of the repository's top-level `LICENSE`. Both the
@@ -33,24 +33,29 @@ ImageFlowNet, which vendored them; they are reproduced unmodified.
 
 Added for this paper:
 
-- `src/datasets/retina_faf_ga.py` — cohort loader: reads the clinical CSV directly, one subject per
+- `src/datasets/retina_faf_ga.py`: cohort loader; reads the clinical CSV directly, one subject per
   patient-eye, weeks-from-baseline as the time axis, 620 crop then resize, and the official
   eye-level split exposed as `predefined_split`.
-- `src/eval_faf_ga.py` — unified evaluation for all three forecasters: leave-one-visit-out folds
-  bucketed into interpolation vs extrapolation, GA scored by a shared frozen segmentor, and
-  test-time adaptation (scenario 2).
-- `eval_spec.py`, `common_preproc.py` — the split contract and the intensity normalisation, shared
-  verbatim with GAP-INR so every method sees identical data.
-- `monitor_panel.py` — the shared TensorBoard validation panel, so runs from either method are
+- `src/eval_faf_ga.py`: unified evaluation for all three forecasters: every forward visit pair,
+  bucketed into interpolation vs extrapolation by whether the target is the eye's last visit, GA
+  scored by a shared frozen segmentor, and test-time optimisation (scenario 2).
+- `eval_spec.py`, `common_preproc.py`: the canonical eye lists and the per-visit intensity
+  normalisation, mirroring GAP-INR's split and normalisation.
+- `monitor_panel.py`: the shared TensorBoard validation panel, so runs from either method are
   comparable by eye.
-- `comparison/interpolation/_classical.py`, `comparison/interpolation/run_seg_interp.py` — the
+- `comparison/interpolation/_classical.py`, `comparison/interpolation/run_seg_interp.py`: the
   classical interpolation/extrapolation floors, including the mask-space floor that scores GA
   directly without a segmentor.
 
-Modified upstream files: `src/train_2pt_all.py` and `src/train_segmentor.py` (cohort support, the
-`--crop-size` option, segmentor-based GA metrics), `src/data_utils/prepare_dataset.py` (honour the
-predefined split), and small fixes in `src/nn/imageflownet_ode.py`, `src/nn/unet_i2sb.py` and
-`src/nn/unet_t_emb.py`.
+Modified upstream files:
+
+- `src/train_2pt_all.py`: cohort support, the `--crop-size` option, training-time augmentation and
+  input noise disabled, early stopping on validation PSNR (`--patience`, `--val-every`), TensorBoard
+  logging.
+- `src/train_segmentor.py`: cohort support, the `--crop-size` option, a positively weighted BCE +
+  soft Dice loss instead of plain BCE (`--seg-pos-weight`), and `--init-from`.
+- `src/data_utils/prepare_dataset.py`: honours the predefined split.
+- Small fixes in `src/nn/imageflownet_ode.py`, `src/nn/unet_i2sb.py` and `src/nn/unet_t_emb.py`.
 
 Rewritten upstream file: `comparison/interpolation/run_baseline_interp.py`. Upstream ships a file at
 this path; it always extrapolates to the last visit of each subarray and scores DICE against
@@ -62,5 +67,6 @@ extrapolation branch of `linear` is upstream's "line through the last two visits
 
 Removed from the upstream tree: the other cohorts (AREDS, UCSF, brain MS/GBM, synthetic) and their
 preprocessing/registration scripts, the `external_src/SuperRetina` registration model, the
-neural-process training entry points, and upstream's pretrained checkpoints and result archives —
-none of which the paper's comparison uses.
+neural-process and predictor training entry points (e.g. `train_predictor.py`), the upstream
+test-time optimisation scripts, and upstream's pretrained checkpoints and result archives. The
+paper's comparison uses none of them.

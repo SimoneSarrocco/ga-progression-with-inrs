@@ -8,6 +8,7 @@ from datetime import datetime
 # Import ModelBuilder
 from build_model import ModelBuilder
 from data_loading.dataset import validate_splits
+from utils import reconstruction_modalities, validate_modality_config
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GAP-INR Standalone Validation & Evaluation Script")
@@ -33,7 +34,7 @@ def parse_args():
                              "eval EXACTLY: for every visit pair (a<b) per eye, fit a fresh latent on "
                              "ONLY the older visit a and predict the newer visit b. Scores interp/extrap "
                              "(b is/ isn't the eye's last visit) + minor/major GA growth, into "
-                             "leave_one_out_summary.csv. Activates test(); overrides --support_k.")
+                             "leave_one_out_summary_pairwise.csv. Activates test(); overrides --support_k.")
     parser.add_argument("--skip_val", action="store_true",
                         help="Skip the validation routine and only run the test evaluation "
                              "(useful with --support_k to get just the forecast numbers).")
@@ -45,8 +46,12 @@ def parse_args():
     # Overrides for optimisation parameters
     parser.add_argument("--epochs_val", type=int, help="Override the number of validation optimisation epochs")
     parser.add_argument("--lr_latent", type=float, help="Override validation learning rate for latents")
-    parser.add_argument("--val_latent_init", type=str, choices=["random", "nearest_train"],
+    parser.add_argument("--val_latent_init", type=str, choices=["random", "nearest_train", "population_mean"],
                         help="Override the validation latent initialisation strategy")
+    parser.add_argument("--tto_reconstruction_modalities", nargs='+', default=None,
+                        help="Observed-visit reconstruction channels used to fit val/test latents, e.g. "
+                             "'faf_path' for FAF+GA TTO or 'faf_path slo_path' for FAF+SLO+GA TTO. "
+                             "GA supervision remains controlled by optimizer.seg_loss_val.")
     
     # Resolution / sampling-grid override (INR is resolution-agnostic -> eval at any grid, no retrain)
     parser.add_argument("--config_data", type=str, default=None,
@@ -120,6 +125,11 @@ def main():
         if isinstance(_sids, str):
             with open(_sids) as _sf:
                 args["dataset"]["subject_ids"] = yaml.safe_load(_sf)[args["dataset"]["dataset_name"]]["subject_ids"]
+        expected_recon = reconstruction_modalities(chkp['args'])
+        resolved_recon = reconstruction_modalities(args)
+        if resolved_recon != expected_recon:
+            raise ValueError(f"Incompatible --config_data modality channels: checkpoint expects "
+                             f"{expected_recon}, override provides {resolved_recon}")
         print(f"Overriding config_data -> {args_cmd.config_data} (dataset section swapped; "
               f"INR evaluated at this sampling grid)")
 
@@ -167,13 +177,18 @@ def main():
     if args_cmd.val_latent_init is not None:
         args["optimizer"]["val_latent_init"] = args_cmd.val_latent_init
         print(f"Overriding optimizer.val_latent_init -> {args_cmd.val_latent_init}")
-        
+
+    if args_cmd.tto_reconstruction_modalities is not None:
+        args["optimizer"]["tto_reconstruction_modalities"] = args_cmd.tto_reconstruction_modalities
+        print(f"Overriding TTO reconstruction modalities -> {args_cmd.tto_reconstruction_modalities}")
+
     if args_cmd.device is not None:
         args["device"] = args_cmd.device
     else:
         args["device"] = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device set to: {args['device']}")
 
+    validate_modality_config(args)
     # Split-integrity + checkpoint-vs-split LEAKAGE guard. validate_splits raises if the
     # current config's train/val/test overlap. The latent-bank check catches the dangerous case
     # where the checkpoint was TRAINED on a different split than we now evaluate on: for a per-eye
@@ -230,11 +245,13 @@ def main():
     args["tb_writer"] = SummaryWriter(log_dir=tb_log_dir)
     print(f"TensorBoard log directory: {tb_log_dir}")
     
-    # Configure ModelBuilder to load model and not run training
+    # Configure ModelBuilder to load model and not run training. Point it at the checkpoint FILE, so
+    # the weights evaluated are the ones in --checkpoint even when no checkpoint_epoch_<N>.pth sits
+    # next to it (e.g. a checkpoint_best.pth copied on its own).
     args["epochs"]["train"] = 0
     args["validate_every"] = 1
     args["load_model"] = {
-        "path": chkp_dir,
+        "path": os.path.abspath(args_cmd.checkpoint),
         "epoch": chkp_epoch
     }
     

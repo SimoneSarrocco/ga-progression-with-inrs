@@ -31,21 +31,16 @@ save_imgs:              # save reconstruction figures per split
   test: False
 save_model: True
 load_model:
-  path: ""              # run dir to resume from; empty = train from scratch
-  epoch: 1
+  path: ""              # run dir (or .pth file) to start from; empty = train from scratch. Loads the
+  epoch: 1              # decoder and latents of checkpoint_epoch_<epoch>.pth; the optimiser and the
+                        # learning-rate schedule start afresh and epochs are counted from 0 again
 
 # --------- Data augmentation ---------
 data_augmentation:
-  activate: false
-  # 'pseudo_eye': each augmented copy of a train eye becomes a NEW eye with its OWN latent, and the
-  # same deterministic transform is applied to ALL of that eye's visits, so the shared latent and the
-  # longitudinal signal stay consistent. 'stochastic': per-load translation/noise on the same latent
-  # (uses augment_translation / augment_noise below).
-  mode: 'pseudo_eye'
-  # --- Intensity (FAF only) ---
-  brightness: 0             # additive brightness in [-b, b]; 0 disables
-  noise_std: 0.02           # additive Gaussian noise std; 0 disables
-  # --- Used only when mode: 'stochastic' ---
+  activate: false           # the paper model trains without augmentation
+  # 'stochastic' (the only implemented mode): shared translation of all modalities and Gaussian noise
+  # on reconstruction images, seeded per eye and epoch, applied to training visits only.
+  mode: 'stochastic'
   augment_translation:
     p: 0.3
     max_shift: 5
@@ -75,7 +70,7 @@ optimizer:
   # adaptation to read off. Over-raising it degrades reconstruction, which moves the adapted latent
   # away from the seg-friendly region and can make test-time segmentation worse.
   seg_weight: 1.0
-  sr_weight: 10.0           # weight on the FAF reconstruction term; the lever that protects recon
+  sr_weight: 10.0           # weight on the aggregate active reconstruction loss
   # Final seg loss = CrossEntropy + seg_dice_weight * SoftDice. Dice is robust to the class imbalance
   # of small GA lesions. 0.0 -> pure CrossEntropy.
   seg_dice_weight: 1.0
@@ -90,6 +85,8 @@ optimizer:
   # Segmentation-supervised adaptation on the acquired visits. The held-out visit stays label-free and
   # is the generalisation measure. Set false for a fully label-free adaptation track.
   seg_loss_val: true
+  # Reconstruction channels used to fit new val/test latents; training always uses every channel.
+  tto_reconstruction_modalities: ['faf_path']
   # One batch = one eye's full visit sequence, so a pooled soft-Dice sees all of that eye's visits.
   batch_by_eye: false
   # The val/test latents can overfit image intensities, so segmentation DICE on the optimisation
@@ -105,7 +102,7 @@ optimizer:
 # --------- INR decoder ---------
 inr_decoder:
   architecture: "siren"
-  tf_dim: 0                 # 0 = off, 6 = rigid, 9 = rigid + scaling
+  tf_dim: 0                 # per-eye coordinate transform; not applied by the current code, keep 0
   cnn_kernel_size: 0        # CNN modulator over the latent grid; spatially mixes the latent before decoding
   # Per-eye latent grid [C, H, W]. Channels carry appearance capacity; the spatial extent decides how
   # much per-eye detail the shared decoder can be handed. Too coarse a grid blurs the reconstruction.
@@ -194,7 +191,8 @@ model_gen:
 validation:
   activate: true
   train_eval_every: 1       # evaluate the train split every N validations
-  log_images_every: 5       # save figures every Nth validation (and always on the final epoch)
+  log_images_every: 5       # log TensorBoard images every Nth validation (and on the final epoch);
+                            # PNG figures on disk are written at every validation
   holdout_strategy: 'last'  # 'last' = hold out the last visit
                             # 'specific' = hold out the visit at holdout_visit
                             # 'leave_one_out' = iterate over every visit position, holding out one at
@@ -226,4 +224,3 @@ lesion_analysis:
   save_individual_plots: false        # per-eye progression curves during training
   save_individual_plots_final: true   # per-eye progression curves at the final epoch
   max_individual_plots: 99999
-  splits: ['train', 'val']

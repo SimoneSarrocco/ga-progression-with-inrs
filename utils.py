@@ -1,5 +1,6 @@
 import math
 import json
+import re
 from types import SimpleNamespace
 import os
 import numpy as np
@@ -70,6 +71,82 @@ class NumpyEncoder(json.JSONEncoder):
 
 
 
+def modality_roles(args):
+    dataset = args.get('dataset', {})
+    modalities = dataset.get('modalities', [])
+    configured = dataset.get('modality_roles')
+    if configured is not None:
+        return dict(configured)
+    out_dim = args.get('inr_decoder', {}).get('out_dim') or []
+    has_seg = bool(out_dim and out_dim[-1] > 0)
+    return {
+        key: 'segmentation' if has_seg and i == len(modalities) - 1 else 'reconstruction'
+        for i, key in enumerate(modalities)
+    }
+
+
+def reconstruction_modalities(args):
+    roles = modality_roles(args)
+    return [key for key in args.get('dataset', {}).get('modalities', [])
+            if roles.get(key) == 'reconstruction']
+
+
+def segmentation_modality(args):
+    roles = modality_roles(args)
+    return next((key for key in args.get('dataset', {}).get('modalities', [])
+                 if roles.get(key) == 'segmentation'), None)
+
+
+def reconstruction_channel_map(args):
+    return {key: i for i, key in enumerate(reconstruction_modalities(args))}
+
+
+def primary_reconstruction_modality(args):
+    configured = args.get('dataset', {}).get('primary_reconstruction_modality')
+    if configured is not None:
+        return configured
+    modalities = reconstruction_modalities(args)
+    return modalities[0] if modalities else None
+
+
+def modality_metric_prefix(key):
+    stem = str(key)
+    if stem.endswith('_path'):
+        stem = stem[:-5]
+    return ''.join(c if c.isalnum() else '_' for c in stem).strip('_').upper()
+
+
+def validate_modality_config(args):
+    dataset = args.get('dataset', {})
+    modalities = dataset.get('modalities', [])
+    if not modalities or len(set(modalities)) != len(modalities):
+        raise ValueError("dataset.modalities must contain unique, non-empty modality keys")
+    roles = modality_roles(args)
+    unknown = set(roles) - set(modalities)
+    missing = set(modalities) - set(roles)
+    invalid = set(roles.values()) - {'reconstruction', 'segmentation'}
+    if unknown or missing or invalid:
+        raise ValueError(f"Invalid modality_roles: unknown={sorted(unknown)}, "
+                         f"missing={sorted(missing)}, invalid_roles={sorted(invalid)}")
+    out_dim = args.get('inr_decoder', {}).get('out_dim') or []
+    if not out_dim:
+        raise ValueError("inr_decoder.out_dim is required")
+    recon = reconstruction_modalities(args)
+    seg = segmentation_modality(args)
+    if sum(out_dim[:-1]) != len(recon):
+        raise ValueError(f"out_dim declares {sum(out_dim[:-1])} reconstruction channels, "
+                         f"but modality_roles defines {len(recon)}: {recon}")
+    if out_dim[-1] > 0 and seg is None:
+        raise ValueError("A segmentation output is configured without a segmentation modality role")
+    if out_dim[-1] == 0 and seg is not None:
+        raise ValueError("A segmentation modality role is configured without segmentation outputs")
+    primary = primary_reconstruction_modality(args)
+    if primary not in recon:
+        raise ValueError(f"primary_reconstruction_modality {primary!r} is not in {recon}")
+    tto = args.get('optimizer', {}).get('tto_reconstruction_modalities')
+    if tto is not None and (not tto or len(set(tto)) != len(tto) or any(key not in recon for key in tto)):
+        raise ValueError(f"tto_reconstruction_modalities must be a non-empty subset of {recon}; got {tto}")
+    return True
 
 
 class Criterion(nn.Module):
@@ -81,6 +158,12 @@ class Criterion(nn.Module):
         self.sr_dims = sum(args['inr_decoder']['out_dim'][:-1])
         self.n_seg_channels = args['inr_decoder']['out_dim'][-1]
         self.has_seg = self.n_seg_channels > 0
+        validate_modality_config(args)
+        self.reconstruction_channels = reconstruction_channel_map(args)
+        modalities = args['dataset']['modalities']
+        self.target_channels = {key: modalities.index(key) for key in self.reconstruction_channels}
+        seg_key = segmentation_modality(args)
+        self.seg_target_channel = modalities.index(seg_key) if seg_key is not None else None
         # Default reconstruction-loss weight (config-driven). Counterbalances the
         # CrossEntropy segmentation loss, which is otherwise ~10-50x larger than the
         # MSE on [0,1]-normalised intensities and dominates training.
@@ -115,9 +198,9 @@ class Criterion(nn.Module):
         """Build a per-coordinate class-probability target (N, C) from the raw seg target column.
         Hard labels -> one-hot; soft labels (mask_grader_mode 'soft', binary) -> [1-t, t]."""
         if self.soft_seg:
-            t = target[..., -1].clamp(0.0, 1.0)                       # (N,) GA probability
+            t = target[..., self.seg_target_channel].clamp(0.0, 1.0)                       # (N,) GA probability
             return torch.stack([1.0 - t, t], dim=-1).to(seg_logits.dtype)  # (N, 2)
-        target_idx = target[..., -1].to(torch.int64)
+        target_idx = target[..., self.seg_target_channel].to(torch.int64)
         return F.one_hot(target_idx, num_classes=self.n_seg_channels).to(seg_logits.dtype)
 
     def _soft_dice_loss(self, seg_logits, target_prob):
@@ -158,16 +241,28 @@ class Criterion(nn.Module):
             if self.ce_weights is not None:
                 return -(self.ce_weights * target_prob * logp).sum(dim=-1).mean()
             return -(target_prob * logp).sum(dim=-1).mean()
-        return self.criterion_seg(seg_logits, target[..., -1].to(torch.int64))
+        return self.criterion_seg(seg_logits, target[..., self.seg_target_channel].to(torch.int64))
 
-    def forward(self, output, target, sr_weight=None, seg_weight=1.0):
+    def forward(self, output, target, sr_weight=None, seg_weight=1.0,
+                active_reconstruction_modalities=None):
         # Components are stored UNWEIGHTED (raw) for interpretable logging; the
         # sr_weight / seg_weight factors are applied only once, in loss['total'].
         sr_weight = self.sr_weight if sr_weight is None else sr_weight
-        loss = {'seg': torch.tensor(0.0),
-                'sr': self.criterion_sr(output[..., :self.sr_dims], target[..., :self.sr_dims]),
-                'trafo': torch.tensor(0.0),
-                'total': 0.0}
+        active = active_reconstruction_modalities or list(self.reconstruction_channels)
+        unknown = set(active) - set(self.reconstruction_channels)
+        if not active or unknown:
+            raise ValueError(f"Invalid active reconstruction modalities {active}; "
+                             f"available={list(self.reconstruction_channels)}")
+        zero = output.sum() * 0.0
+        loss = {'seg': zero, 'sr': zero, 'trafo': zero, 'total': zero}
+        active_losses = []
+        for key in active:
+            output_channel = self.reconstruction_channels[key]
+            target_channel = self.target_channels[key]
+            component = self.criterion_sr(output[..., output_channel], target[..., target_channel])
+            loss[f"sr_{modality_metric_prefix(key).lower()}"] = component
+            active_losses.append(component)
+        loss['sr'] = torch.stack(active_losses).mean()
 
         if seg_weight > 0 and self.has_seg:
             seg_logits = output[..., self.sr_dims:self.sr_dims + self.n_seg_channels]
@@ -237,9 +332,9 @@ def to_device(x, device='cuda'):
     if isinstance(x, torch.Tensor):
         return x.to(device, non_blocking=True)
     elif isinstance(x, (list, tuple)):
-        return type(x)(to_device(t) for t in x)
+        return type(x)(to_device(t, device) for t in x)
     elif isinstance(x, dict):
-        return {k: to_device(v) for k, v in x.items()}
+        return {k: to_device(v, device) for k, v in x.items()}
     else:
         return x  # Leave non-tensor data as is
     
@@ -390,21 +485,21 @@ def save_subject(args, img, sub_row_df=None, sub_name=None, epoch=0, split='trai
     mytx = None
     modalities = args['dataset']['modalities']
     has_seg = args['inr_decoder']['out_dim'][-1] > 0
-    for i, mod in enumerate(modalities): # for each modality (last modality is segmentation if has_seg)
-        is_seg = has_seg and (i == len(modalities)-1)
+    recon_channels = reconstruction_channel_map(args)
+    seg_modality = segmentation_modality(args)
+    sr_dims = len(recon_channels)
+    for i, mod in enumerate(modalities):
+        is_seg = has_seg and mod == seg_modality
         if is_seg:
             # inference output: [imgs(sr_dims), seg_hard(1), seg_soft(n_classes)]
-            # Skip seg_hard, argmax only over seg_soft channels
-            sr_dims = len(modalities) - 1
             n_seg_classes = img.shape[-1] - sr_dims - 1
-
             if n_seg_classes > 0:
-                seg_soft = img[..., sr_dims + 1:sr_dims + 1 + n_seg_classes]  # skip seg_hard channel, explicit bound
+                seg_soft = img[..., sr_dims + 1:sr_dims + 1 + n_seg_classes]
                 img_mod = np.argmax(seg_soft, axis=-1).astype(np.int16)
             else:
-                img_mod = img[..., i].astype(np.int16)
+                img_mod = img[..., sr_dims].astype(np.int16)
         else:
-            img_mod = img[..., i].astype(np.float32)
+            img_mod = img[..., recon_channels[mod]].astype(np.float32)
         # Structured path: {split}/{eye_id}/{mod}_{visit_id}_ep={epoch}
         filename = f'{split}/{eye_id}/{mod}_{visit_id}_ep={epoch}.nii.gz'
         # save_img(img_mod, affine, args['output_dir'], filename)
@@ -425,7 +520,6 @@ def save_subject(args, img, sub_row_df=None, sub_name=None, epoch=0, split='trai
 
             # --- Longitudinal Change/Difference Maps ---
             if baseline_volume is not None:
-                sr_dims = len(modalities) - 1
                 if is_seg:
                     # GA Change Map: Compare current argmax with baseline argmax
                     n_seg_classes = img.shape[-1] - sr_dims - 1
@@ -440,7 +534,7 @@ def save_subject(args, img, sub_row_df=None, sub_name=None, epoch=0, split='trai
                             base_mask = np.argmax(baseline_volume[..., sr_dims+1:sr_dims+1+base_n_seg_classes], axis=-1)
                     else:
                         pred_mask = (img_mod > 0).astype(np.uint8)
-                        base_mask = (baseline_volume[..., i] > 0).astype(np.uint8)
+                        base_mask = (baseline_volume[..., sr_dims] > 0).astype(np.uint8)
 
                     # Build RGB Change Map
                     # Green [0,1,0]: Stable, Red [1,0,0]: Growth, Blue [0,0,1]: Resolved
@@ -451,13 +545,13 @@ def save_subject(args, img, sub_row_df=None, sub_name=None, epoch=0, split='trai
                     change_map[stable] = [0.2, 0.8, 0.4] # Green
                     change_map[growth] = [0.9, 0.1, 0.1] # Red
                     change_map[lost]   = [0.2, 0.4, 0.9] # Blue
-                    
+
                     # Log as RGB image
                     tag_change = f'{split}/{eye_id}/change_map/{mod}/{visit_id}'
                     tb_writer.add_image(tag_change, change_map, epoch, dataformats='HWC')
                 else:
                     # Intensity Difference Map
-                    base_mod = baseline_volume[..., i]
+                    base_mod = baseline_volume[..., recon_channels[mod]]
                     # Normalise both to [0, 1] for fair comparison
                     p_min, p_max = img_mod.min(), img_mod.max()
                     b_min, b_max = base_mod.min(), base_mod.max()
@@ -567,7 +661,7 @@ def compute_metrics(
     Always (intra-visit differences):
       {split}/{eye_id}/{mod}/{visit_id}_pred        predicted current visit
       {split}/{eye_id}/{mod}/{visit_id}_ref         GT current visit
-      {split}/{eye_id}/{mod}/{visit_id}_diff_pred_gt  pred minus GT (FAF only)
+      {split}/{eye_id}/{mod}/{visit_id}_diff_pred_gt  pred minus GT (intensity images)
       {split}/{eye_id}/{mod}/{visit_id}_diff_pred_gt_seg  TP/FP/FN map (seg only)
 
     When baseline_volume is provided (differences wrt predicted baseline, with the aim of understanding whether the model is wrongly predicting always the same images regardless of time or not):
@@ -615,6 +709,13 @@ def compute_metrics(
     sub_id = f"{eye_id}_{visit_id}"
     metrics = {'Subject': sub_id, 'PSNR': [], 'SSIM': [], 'LPIPS': [], 'DICE': [], 'Precision': [], 'Recall': [], 'IoU': [], 'HD': [], 'LOSS': []}
     modalities = args['dataset']['modalities']
+    recon_modalities = reconstruction_modalities(args)
+    recon_channels = reconstruction_channel_map(args)
+    seg_modality = segmentation_modality(args)
+    primary_modality = primary_reconstruction_modality(args)
+    for key in recon_modalities:
+        for metric_name in ('PSNR', 'SSIM', 'LPIPS'):
+            metrics[f'{modality_metric_prefix(key)}_{metric_name}'] = []
 
     if bg_label is None and args['dataset'].get('label_names') and 'BG' in args['dataset']['label_names']:
         bg_label = args['dataset']['label_names'].index('BG')
@@ -625,12 +726,13 @@ def compute_metrics(
     img_dict = {}
 
     for i, mod in enumerate(modalities):
-        is_seg = has_seg and (i == len(modalities) - 1)
+        is_seg = has_seg and mod == seg_modality
         ref_path = df_row_dict[mod]
         mod_imgs = {}
 
         # Load GT current visit normalised between [0,1]
-        ref_data = load_2d_modality(ref_path, is_seg, patient_stats=patient_stats, mod_index=i, args=args)
+        ref_data = load_2d_modality(ref_path, is_seg, patient_stats=patient_stats,
+                                    mod_index=recon_channels.get(mod, 0), args=args)
 
         # Crop reference using sampling_bbox if specified
         sampling_bbox = args['dataset'].get('sampling_bbox')
@@ -646,18 +748,12 @@ def compute_metrics(
                 x_min, y_min, x_max, y_max = sampling_bbox
             ref_data = ref_data[y_min:y_max+1, x_min:x_max+1]
 
-        # Extract prediction channel
+        # Inference output is [reconstruction channels, hard segmentation, soft segmentation].
         if is_seg:
-            sr_dims = len(modalities) - 1
-            # n_seg_classes = pred.shape[-1] - sr_dims - 1
-            # we extract the soft segmentations
-            # seg_soft = pred[..., sr_dims + 1:sr_dims + 1 + n_seg_classes]
-            seg_hard = pred[..., sr_dims]
-            pred_data = seg_hard.astype(np.float32)
-            # pred_data = np.argmax(seg_soft, axis=-1).astype(np.float32)
+            sr_dims = len(recon_modalities)
+            pred_data = pred[..., sr_dims].astype(np.float32)
         else:
-            pred_data = pred[..., i].astype(np.float32)
-            # pred_data = _minmax(pred_data)
+            pred_data = pred[..., recon_channels[mod]].astype(np.float32)
 
         # Centre crop reference to match prediction shape if they differ
         if ref_data.shape != pred_data.shape:
@@ -686,11 +782,19 @@ def compute_metrics(
 
         # Metrics --> always computed between predicted current visit and corresponding GT current visit
         if not is_seg:
-            metrics['PSNR'].append(psnr_metric(pred_m, ref_m, data_range=1.0))
-            metrics['SSIM'].append(ssim_metric(pred_m, ref_m, data_range=1.0))
+            prefix = modality_metric_prefix(mod)
+            psnr_value = psnr_metric(pred_m, ref_m, data_range=1.0)
+            ssim_value = ssim_metric(pred_m, ref_m, data_range=1.0)
+            metrics[f'{prefix}_PSNR'].append(psnr_value)
+            metrics[f'{prefix}_SSIM'].append(ssim_value)
+            if mod == primary_modality:
+                metrics['PSNR'].append(psnr_value)
+                metrics['SSIM'].append(ssim_value)
             _lp = _lpips_score(pred_m, ref_m)
             if _lp is not None:
-                metrics['LPIPS'].append(_lp)
+                metrics[f'{prefix}_LPIPS'].append(_lp)
+                if mod == primary_modality:
+                    metrics['LPIPS'].append(_lp)
         else:
             seg_m = compute_seg_overlap_metrics(pred_m, ref_m, bg_label)
             metrics['DICE'].append(seg_m['DICE'])
@@ -738,12 +842,11 @@ def compute_metrics(
 
         # Longitudinal Difference Maps --> comparison between model's current predicted visit and the predicted baseline visit --> to see if the model is learning temporal dynamics or just predicting the same image across different timepoints
         if baseline_volume is not None:
-            sr_dims = len(modalities) - 1
+            sr_dims = len(recon_modalities)
             base_n_seg_classes = baseline_volume.shape[-1] - sr_dims - 1
-                
+
             if not is_seg:
-                # base_mod = _minmax(baseline_volume[..., i].astype(np.float32))
-                base_mod = baseline_volume[..., i].astype(np.float32)  # predicted baseline visit
+                base_mod = baseline_volume[..., recon_channels[mod]].astype(np.float32)
                 diff_long = _signed_diff_map_gray(pred_data, base_mod)  # difference map between predicted current visit and predicted baseline visit
                 if return_images: mod_imgs['diff_long'] = diff_long
                 if tb_writer is not None and not return_images:
@@ -753,7 +856,7 @@ def compute_metrics(
                     # base_mask = np.argmax(baseline_volume[..., sr_dims + 1:sr_dims + 1 + base_n_seg_classes], axis=-1).astype(np.float32)
                     base_mask = baseline_volume[..., sr_dims].astype(np.float32)  # predicted baseline segmentation
                 else:
-                    base_mask = (baseline_volume[..., i] > 0).astype(np.float32)
+                    base_mask = (baseline_volume[..., sr_dims] > 0).astype(np.float32)
                 change_rgb = _seg_change_map(pred_data, base_mask)  # segmentation change map between predicted current visit and predicted baseline visit
                 if return_images: mod_imgs['change_long'] = change_rgb
                 if tb_writer is not None and not return_images:
@@ -763,7 +866,8 @@ def compute_metrics(
         if gt_baseline_row is not None:
             gt_base_path = gt_baseline_row.get(mod, None)
             if gt_base_path is not None:
-                gt_base_data = load_2d_modality(gt_base_path, is_seg, patient_stats=patient_stats, mod_index=i, args=args)  # GT baseline visit
+                gt_base_data = load_2d_modality(gt_base_path, is_seg, patient_stats=patient_stats,
+                                                mod_index=recon_channels.get(mod, 0), args=args)
 
                 # Crop baseline using sampling_bbox if specified
                 if sampling_bbox is not None:
@@ -821,10 +925,12 @@ def compute_metrics(
     # user-requested "validation loss") in addition to the held-out DICE. Composition mirrors the
     # training loss: seg term (1 - GA Dice) + recon_weight * recon MSE. MSE is recovered from PSNR
     # (data_range=1 -> MSE = 10^(-PSNR/10)). Lower is better.
-    if metrics['DICE'] and metrics['PSNR']:
+    recon_psnr = [value for key in recon_modalities
+                  for value in metrics[f'{modality_metric_prefix(key)}_PSNR']]
+    if metrics['DICE'] and recon_psnr:
         _srw = float(args['optimizer'].get('outer_sr_weight',
                                            args['optimizer'].get('sr_weight', 1.0)))
-        _mse = float(np.mean([10.0 ** (-float(p) / 10.0) for p in metrics['PSNR']]))
+        _mse = float(np.mean([10.0 ** (-float(p) / 10.0) for p in recon_psnr]))
         _segloss = 1.0 - float(np.mean(metrics['DICE']))
         metrics['LOSS'] = [float(_segloss + _srw * _mse)]
 
@@ -1148,42 +1254,39 @@ def log_metrics(args, metrics, epoch, df=None, split='train', tb_writer=None):
     metrics_sub-i = {metric-1: [val-mod1, val-mod2, ...], metric-2: [val-mod1, val-mod2, ...]}
     """
     metrics_keys = ['PSNR', 'SSIM', 'LPIPS', 'DICE', 'Precision', 'Recall', 'IoU', 'HD', 'LOSS']
-    mod_keys = args['dataset']['modalities']
-    # Map each metric to the modalities it was actually computed on, mirroring compute_metrics'
-    # rule (modality i is segmentation iff has_seg and i == last). Intensity metrics (PSNR/SSIM) are
-    # computed on the intensity modalities (all but the last when seg is present); segmentation
-    # metrics (DICE/Precision/Recall/IoU) are computed on the seg modality (the last one). Without
-    # this, the per-subject seg list has one element and was mislabelled under the FIRST modality.
-    has_seg = args['inr_decoder']['out_dim'][-1] > 0
-    intensity_mods = mod_keys[:-1] if has_seg else list(mod_keys)
-    seg_mods = [mod_keys[-1]] if has_seg else []
+    modality_keys = sorted({key for entry in metrics for key in entry
+                            if re.match(r'^[A-Z0-9_]+_(?:PSNR|SSIM|LPIPS)$', key)})
+    metrics_keys += [key for key in modality_keys if key not in metrics_keys]
+    primary_mod = primary_reconstruction_modality(args)
+    seg_mods = [segmentation_modality(args)] if segmentation_modality(args) is not None else []
     seg_metric_keys = {'DICE', 'Precision', 'Recall', 'IoU', 'HD'}
     wandb_payload = {}  # batch all (metric, modality) values into ONE wd.log call (shared step)
 
     for metric_key in metrics_keys:
-        # Modalities this metric belongs to (so the tag uses the correct modality name).
-        mods_for_metric = seg_mods if metric_key in seg_metric_keys else intensity_mods
+        if metric_key in seg_metric_keys:
+            mods_for_metric = seg_mods
+        elif metric_key in ('PSNR', 'SSIM', 'LPIPS'):
+            mods_for_metric = [primary_mod]
+        else:
+            mods_for_metric = [None]
 
-        # Collect all values for this metric across all subjects
-        # Each entry in metrics[sub][metric_key] is a list [val_mod1, val_mod2, ...]
         all_vals = []
         for m_sub in metrics:
             if metric_key in m_sub and len(m_sub[metric_key]) > 0:
                 all_vals.append(m_sub[metric_key])
-
         if not all_vals:
             continue
 
-        all_vals = np.array(all_vals) # (N_subs, N_mods)
-        means = np.mean(all_vals, axis=0) # (N_mods,)
+        all_vals = np.array(all_vals)
+        means = np.mean(all_vals, axis=0)
         stds = np.std(all_vals, axis=0)
 
         for i, mod in enumerate(mods_for_metric):
-            if i >= len(means): break
+            if i >= len(means):
+                break
             m_mean = means[i].item()
             m_std = stds[i].item()
-            
-            tag = f"{split}/{mod}_{metric_key}"
+            tag = f"{split}/{metric_key}" if mod is None else f"{split}/{mod}_{metric_key}"
             print(f"{tag}: {m_mean:.3f} +/- {m_std:.3f}")
 
             if args['logging']:
@@ -1230,43 +1333,35 @@ def log_loss(loss, epoch, split, log=True, tb_writer=None, global_step=None):
         for k in ['tf_rot', 'tf_trans', 'tf_scale', 'tf']:
             if k in loss:
                 payload[f"{split}/loss_{k}"] = _val(loss[k])
+        for key, value in loss.items():
+            if key.startswith('sr_'):
+                payload[f'{split}/loss_{key}'] = _val(value)
         wd.log(payload)
     # Log to TensorBoard
     if tb_writer is not None:
-        for key in ['total', 'sr', 'seg', 'tf', 'tf_rot', 'tf_trans', 'tf_scale']:
+        keys = ['total', 'sr', 'seg', 'tf', 'tf_rot', 'tf_trans', 'tf_scale']
+        keys += [key for key in loss if key.startswith('sr_')]
+        for key in keys:
             if key in loss:
                 tb_writer.add_scalar(f'{split}/loss_{key}', _val(loss[key]), tb_step)
         tb_writer.flush()
 
 
-def normalize_intensities(values, norm_type, has_seg=True):
-    """
-    Normalise values according to norm_type
-    Args:
-        values: numpy array of shape (n_samples, n_modalities)
-        norm_type: str, 'minmax' or 'zscore'
-        has_seg: bool, if True the last column is segmentation (excluded from normalisation)
-    Returns:
-        normalized_values: numpy array of shape (n_samples, n_modalities)
-    """
+def normalize_intensities(values, norm_type, has_seg=True, reconstruction_indices=None):
+    """Normalise reconstruction channels independently, leaving segmentation targets unchanged."""
     values = np.clip(values, 0, None)
-    if has_seg:
-        values_mod = values[..., :-1]
-    else:
-        values_mod = values
+    if reconstruction_indices is None:
+        reconstruction_indices = list(range(values.shape[-1] - 1 if has_seg else values.shape[-1]))
     if norm_type == 'minmax':
+        values_mod = values[..., reconstruction_indices]
         v_min, v_max = values_mod.min(axis=0), values_mod.max(axis=0)
-        # Avoid division by zero
         denom = v_max - v_min
         denom[denom == 0] = 1.0
-        values_mod = (values_mod - v_min) / denom
+        values[..., reconstruction_indices] = (values_mod - v_min) / denom
     elif norm_type == 'zscore':
+        values_mod = values[..., reconstruction_indices]
         v_mean, v_std = values_mod.mean(axis=0), values_mod.std(axis=0)
-        values_mod = (values_mod - v_mean) / (v_std + 1e-5)
-    if has_seg:
-        values[..., :-1] = values_mod
-    else:
-        values = values_mod
+        values[..., reconstruction_indices] = (values_mod - v_mean) / (v_std + 1e-5)
     return values
 
 
