@@ -60,7 +60,7 @@ optimizer:
     weight: 1.0
   # GA supervision during TTO. The held-out visit remains label-free.
   seg_loss_val: true
-  # Training always uses FAF+SLO+GA. TTO defaults to FAF+SLO+GA; use ['faf_path'] for FAF+GA.
+  # Training always uses FAF+SLO+GA. TTO supports FAF+SLO+GA, FAF+GA, or SLO+GA.
   tto_reconstruction_modalities: ['faf_path', 'slo_path']
   batch_by_eye: false
   val_early_stopping:

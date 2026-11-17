@@ -78,7 +78,7 @@ faf_ga_twovar_wktemporal_512:
   sampling_bbox: null
 
 # MULTIMODAL MODEL. One ordered target triplet [FAF, SLO, GA] per eye-visit.
-faf_slo_ga_twovar_wktemporal_512:
+faf_slo_ga_twovar_wktemporal_512: &faf_slo_ga
   <<: *faf_ga
   modalities: ['faf_path', 'slo_path', 'ga_mask_path']
   modality_roles:
@@ -89,6 +89,21 @@ faf_slo_ga_twovar_wktemporal_512:
   crop_before_resize: [620, 620]
   world_bbox: [512, 512]
   sampling_bbox: null
+
+# Multimodal evaluation grids matching the FAF+GA sections below.
+faf_slo_ga_twovar_wktemporal_256:
+  <<: *faf_slo_ga
+  world_bbox: [256, 256]
+
+faf_slo_ga_twovar_wktemporal_620:
+  <<: *faf_slo_ga
+  crop_before_resize: null
+  world_bbox: [620, 620]
+  sampling_bbox: [620, 620]
+
+faf_slo_ga_twovar_wktemporal_512_to256:
+  <<: *faf_slo_ga
+  metric_resize: [256, 256]
 
 # EVAL ONLY -- 620 crop -> 256 grid, matching the ImageFlowNet baselines' native resolution
 # (baselines/imageflownet). Use for the extrapolation comparison when you want GAP-INR to both

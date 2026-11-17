@@ -69,23 +69,33 @@ required for every retained visit; FAF and SLO intensities are normalised indepe
 python run.py --config_model configs/config_model_faf_slo_ga.yaml
 ```
 
-TTO can use either FAF+GA or FAF+SLO+GA on the observed visits, without changing the checkpoint or
+TTO can use FAF+GA, FAF+SLO+GA, or SLO+GA on the observed visits, without changing the checkpoint or
 held-out evaluation. With `optimizer.seg_loss_val: true`, select the reconstruction channels with:
 
 ```bash
-# FAF+GA latent optimisation
+# M-FAF: FAF+GA latent optimisation
 python evaluate.py --checkpoint <multimodal_checkpoint> \
-    --tto_reconstruction_modalities faf_path --output_dir <eval_faf_ga>
+    --holdout_strategy leave_one_out --test on --skip_val \
+    --tto_reconstruction_modalities faf_path --output_dir <eval_m_faf>
 
-# FAF+SLO+GA latent optimisation
+# M-both: FAF+SLO+GA latent optimisation
 python evaluate.py --checkpoint <multimodal_checkpoint> \
-    --tto_reconstruction_modalities faf_path slo_path --output_dir <eval_faf_slo_ga>
+    --holdout_strategy leave_one_out --test on --skip_val \
+    --tto_reconstruction_modalities faf_path slo_path --output_dir <eval_m_both>
+
+# M-SLO: SLO+GA latent optimisation
+python evaluate.py --checkpoint <multimodal_checkpoint> \
+    --holdout_strategy leave_one_out --test on --skip_val \
+    --tto_reconstruction_modalities slo_path --output_dir <eval_m_slo>
 ```
 
-`seg_loss_val: false` remains the reconstruction-only ablation. Use separate output directories for
-TTO modes because each saves its own latents and metrics. Evaluation reports `FAF_PSNR`/`FAF_SSIM`/
-`FAF_LPIPS` and the corresponding `SLO_*` metrics separately. Unqualified PSNR/SSIM/LPIPS remain FAF
-aliases for backward compatibility; the combined `LOSS` uses all training reconstruction channels.
+For validation-only TTO selection, replace `--test on --skip_val` with `--test off`. Add
+`--config_data faf_slo_ga_twovar_wktemporal_512_to256` for the ImageFlowNet-matched scoring grid or
+`--config_data faf_slo_ga_twovar_wktemporal_620` for native-pitch interpolation. Use separate output
+directories for TTO modes because each saves its own latents and metrics. `seg_loss_val: false`
+remains the reconstruction-only ablation. Evaluation reports `FAF_PSNR`/`FAF_SSIM`/`FAF_LPIPS` and
+the corresponding `SLO_*` metrics separately. Unqualified PSNR/SSIM/LPIPS remain FAF aliases for
+backward compatibility; the combined `LOSS` uses all training reconstruction channels.
 
 ---
 
