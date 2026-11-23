@@ -548,12 +548,26 @@ class ModelBuilder:
                 loss['latent_reg'] = reg_term
                 loss['total'] = loss['total'] + reg_term
 
+            max_grad_norm = float(self.args['optimizer'].get('max_grad_norm', 0.0) or 0.0)
             if self.args['amp']:
                 self.grad_scalers[split].scale(loss['total']).backward()
+                if max_grad_norm > 0:
+                    self.grad_scalers[split].unscale_(self.optimizers[split])
+                    clip_params = (
+                        list(self.inr_decoder[split].parameters()) + [self.latents[split]]
+                        if split == 'train' else [self.latents[split]]
+                    )
+                    torch.nn.utils.clip_grad_norm_(clip_params, max_grad_norm)
                 self.grad_scalers[split].step(self.optimizers[split])
                 self.grad_scalers[split].update()
             else:
                 loss['total'].backward()
+                if max_grad_norm > 0:
+                    clip_params = (
+                        list(self.inr_decoder[split].parameters()) + [self.latents[split]]
+                        if split == 'train' else [self.latents[split]]
+                    )
+                    torch.nn.utils.clip_grad_norm_(clip_params, max_grad_norm)
                 self.optimizers[split].step()
 
             loss_hist_samples.append(loss['total'].item())  # we append the loss computed for each specific sample of coordinates of the same batch

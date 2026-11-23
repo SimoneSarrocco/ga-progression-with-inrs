@@ -35,8 +35,9 @@ class INR_Decoder(nn.Module):
                 num_heads=la_cfg.get('num_heads', 8),
                 ffn_mult=la_cfg.get('ffn_mult', 2.0),
                 dropout=la_cfg.get('dropout', 0.0),
-                use_ffn=la_cfg.get('use_ffn', True),
+                use_ffn=la_cfg.get('use_ffn', False),
                 use_pos_embed=la_cfg.get('use_pos_embed', True),
+                residual_scale=la_cfg.get('residual_scale', 0.5),
             )
         else:
             self.latent_attention = nn.Identity()
@@ -47,6 +48,7 @@ class INR_Decoder(nn.Module):
             cr_cfg = {'activate': cr_cfg}
         channel_recal_activate = bool(cr_cfg.get('activate', False))
         channel_recal_reduction = int(cr_cfg.get('reduction', 8))
+        channel_recal_max_delta = float(cr_cfg.get('max_delta', 0.2))
 
         # Initialise Coordinate Encoding
         self.encoding = get_encoding(args_inr, args.get('encoding'))
@@ -124,7 +126,8 @@ class INR_Decoder(nn.Module):
                             seg_branch_modulate=args_inr.get('seg_branch', {}).get('modulate', True),
                             shared_output_layer=args_inr.get('shared_output_layer', False),
                             channel_recal_activate=channel_recal_activate,
-                            channel_recal_reduction=channel_recal_reduction)
+                            channel_recal_reduction=channel_recal_reduction,
+                            channel_recal_max_delta=channel_recal_max_delta)
 
     def encode_latent_grids(self, latent_grids):
         """Apply CNN modulator and optional spatial self-attention to active latent grids."""

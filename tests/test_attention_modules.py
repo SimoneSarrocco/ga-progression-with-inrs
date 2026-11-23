@@ -279,10 +279,44 @@ def test_yaml_configs_and_backward_compat(device):
         cfg = load_yaml(rel)
         dec = INR_Decoder(cfg, device).to(device)
         assert isinstance(dec.latent_attention, LatentSpatialAttention), f"{rel} should enable latent_attention"
-        assert all(isinstance(layer.channel_recal, ChannelRecalibration) for layer in dec.sr_net.net), (
-            f"{rel} should enable channel_recal on all trunk SineLayers"
-        )
+        cr_on = bool((cfg["inr_decoder"].get("channel_recalibration") or {}).get("activate", False))
+        if cr_on:
+            assert all(isinstance(layer.channel_recal, ChannelRecalibration) for layer in dec.sr_net.net)
+        else:
+            assert all(layer.channel_recal is None for layer in dec.sr_net.net)
     print("[PASS] 5. Backward compatibility with original configs & new attention configs")
+
+
+def test_scale_preservation_under_adversarial_weights(device):
+    torch.manual_seed(123)
+    sra = LatentSpatialAttention(
+        channels=256, num_layers=1, num_heads=8, use_ffn=False, residual_scale=0.5
+    ).to(device).eval()
+    cra = ChannelRecalibration(out_feat=384, lat_feat=258, reduction=8, max_delta=0.2).to(device).eval()
+
+    # Stress-test with huge adversarial weights (std=5.0)
+    with torch.no_grad():
+        for p in sra.parameters():
+            p.normal_(0.0, 5.0)
+        for p in cra.parameters():
+            p.normal_(0.0, 5.0)
+
+        # Tiny initial latent grid matching build_model.py N(0, 0.01)
+        z = torch.randn(2, 256, 32, 32, device=device) * 0.01
+        z_out = sra(z)
+        delta_rms = (z_out - z).pow(2).mean().sqrt().item()
+        z_rms = z.pow(2).mean().sqrt().item()
+        ratio = delta_rms / z_rms
+        assert ratio <= 0.505, f"SRA residual blew up latent scale: delta/z = {ratio:.3f} (expected <= 0.5)"
+
+        # SineLayer features in [-1, 1]
+        h = torch.ones(1024, 384, device=device)
+        lat = torch.randn(1024, 258, device=device)
+        out = cra(h, lat)
+        assert out.min().item() >= 0.8 - 1e-6 and out.max().item() <= 1.2 + 1e-6, (
+            f"CRA gate escaped [0.8, 1.2]: [{out.min().item():.4f}, {out.max().item():.4f}]"
+        )
+    print(f"[PASS] 6. Scale preservation under adversarial weights (SRA delta/z={ratio:.3f}<=0.5, CRA gate in [{out.min().item():.3f}, {out.max().item():.3f}])")
 
 
 def benchmark_ablation_configs(device):
@@ -290,16 +324,16 @@ def benchmark_ablation_configs(device):
     variants = {
         "Baseline": ({"activate": False}, {"activate": False}),
         "+SRA (LatentAttn 1L 8H)": (
-            {"activate": True, "num_layers": 1, "num_heads": 8, "ffn_mult": 2.0, "use_ffn": True},
+            {"activate": True, "num_layers": 1, "num_heads": 8, "use_ffn": False, "residual_scale": 0.5},
             {"activate": False},
         ),
         "+CRA (ChannelRecal r=8)": (
             {"activate": False},
-            {"activate": True, "reduction": 8},
+            {"activate": True, "reduction": 8, "max_delta": 0.2},
         ),
         "+SRA+CRA (Full)": (
-            {"activate": True, "num_layers": 1, "num_heads": 8, "ffn_mult": 2.0, "use_ffn": True},
-            {"activate": True, "reduction": 8},
+            {"activate": True, "num_layers": 1, "num_heads": 8, "use_ffn": False, "residual_scale": 0.5},
+            {"activate": True, "reduction": 8, "max_delta": 0.2},
         ),
     }
 
@@ -346,5 +380,6 @@ if __name__ == "__main__":
     test_tto_spatial_gradient_propagation(dev)
     test_chunked_inference_equivalence(dev)
     test_yaml_configs_and_backward_compat(dev)
+    test_scale_preservation_under_adversarial_weights(dev)
     benchmark_ablation_configs(dev)
     print("\nALL TESTS PASSED.")

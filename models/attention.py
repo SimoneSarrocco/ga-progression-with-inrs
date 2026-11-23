@@ -82,7 +82,19 @@ def build_nd_sincos_pos_embed(
 
 
 class SpatialAttentionBlock(nn.Module):
-    """Pre-LN Multi-Head Self-Attention + optional FFN with zero-init residual projections."""
+    """
+    Scale-preserving Pre-LN Multi-Head Self-Attention (+ optional FFN) for SIREN latent grids.
+
+    Key stability guarantees for auto-decoded latent grids (whose natural std starts at 0.01
+    and grows to ~0.18 during training):
+      1. Sinusoidal positional encoding is added ONLY to Q and K (never V), so attention
+         mixes eye-specific latent content without injecting shared spatial patterns.
+      2. QK-LayerNorm bounds attention logits throughout long training runs.
+      3. Residual updates are bounded via tanh and scaled by the input latent grid's own RMS
+         (`x_rms * residual_scale * tanh(proj(attn_out))`), preventing scale blowup and
+         SIREN frequency phase-wrapping.
+      4. Output projections are zero-initialized -> exact identity at step 0.
+    """
 
     def __init__(
         self,
@@ -90,7 +102,8 @@ class SpatialAttentionBlock(nn.Module):
         num_heads: int = 8,
         ffn_mult: float = 2.0,
         dropout: float = 0.0,
-        use_ffn: bool = True,
+        use_ffn: bool = False,
+        residual_scale: float = 0.5,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -100,9 +113,14 @@ class SpatialAttentionBlock(nn.Module):
         self.head_dim = dim // num_heads
         self.dropout = float(dropout)
         self.use_ffn = bool(use_ffn)
+        self.residual_scale = float(residual_scale)
 
         self.norm1 = nn.LayerNorm(dim)
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.q_proj = nn.Linear(dim, dim, bias=True)
+        self.k_proj = nn.Linear(dim, dim, bias=True)
+        self.v_proj = nn.Linear(dim, dim, bias=True)
+        self.q_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim)
         self.proj = nn.Linear(dim, dim, bias=True)
 
         # Zero-init output projection -> exact identity residual at initialization
@@ -123,24 +141,27 @@ class SpatialAttentionBlock(nn.Module):
         """
         Args:
             x:         (B, N_tokens, C)
-            pos_embed: (1, N_tokens, C) optional sinusoidal positional encoding
+            pos_embed: (1, N_tokens, C) optional sinusoidal positional encoding (applied to Q/K only)
         """
         B, N, C = x.shape
-        h = self.norm1(x)
-        if pos_embed is not None:
-            h = h + pos_embed
+        x_rms = x.detach().pow(2).mean(dim=(1, 2), keepdim=True).add(1e-6).sqrt()
 
-        qkv = self.qkv(h).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        h = self.norm1(x)
+        h_qk = h + pos_embed if pos_embed is not None else h
+
+        q = self.q_norm(self.q_proj(h_qk).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2))
+        k = self.k_norm(self.k_proj(h_qk).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2))
+        v = self.v_proj(h).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
         drop_p = self.dropout if self.training else 0.0
         attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop_p)
         attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
-        x = x + self.proj(attn_out)
+        x = x + x_rms * (self.residual_scale * torch.tanh(self.proj(attn_out)))
 
         if self.use_ffn:
+            x_rms2 = x.detach().pow(2).mean(dim=(1, 2), keepdim=True).add(1e-6).sqrt()
             h2 = self.ffn_fc2(self.ffn_drop(self.ffn_act(self.ffn_fc1(self.norm2(x)))))
-            x = x + h2
+            x = x + x_rms2 * (self.residual_scale * torch.tanh(h2))
         return x
 
 
@@ -157,12 +178,14 @@ class LatentSpatialAttention(nn.Module):
         num_heads: int = 8,
         ffn_mult: float = 2.0,
         dropout: float = 0.0,
-        use_ffn: bool = True,
+        use_ffn: bool = False,
         use_pos_embed: bool = True,
+        residual_scale: float = 0.5,
     ):
         super().__init__()
         self.channels = int(channels)
         self.use_pos_embed = bool(use_pos_embed)
+        self.residual_scale = float(residual_scale)
         self.blocks = nn.ModuleList([
             SpatialAttentionBlock(
                 dim=self.channels,
@@ -170,6 +193,7 @@ class LatentSpatialAttention(nn.Module):
                 ffn_mult=float(ffn_mult),
                 dropout=float(dropout),
                 use_ffn=bool(use_ffn),
+                residual_scale=self.residual_scale,
             )
             for _ in range(int(num_layers))
         ])
@@ -218,18 +242,21 @@ class ChannelRecalibration(nn.Module):
     """
     INRAM-inspired pointwise Channel Recalibration Attention for SIREN hidden layers.
 
-    Computes a bounded multiplicative channel gate in (0, 2) conditioned on the layer's
-    sine features (and optionally the local latent/condition vector):
-        gate = 1.0 + tanh(W2(SiLU(W1([h, lat]))))
+    Computes a tightly bounded multiplicative channel gate in (1 - max_delta, 1 + max_delta)
+    conditioned on the layer's sine features (and optionally the local latent/condition vector):
+        gate = 1.0 + max_delta * tanh(W2(SiLU(W1([h, lat]))))
         out  = h * gate
 
-    W2 and b2 are zero-initialized so gate == 1.0 identically at initialization.
+    Keeping max_delta small (default 0.2 -> gate in (0.8, 1.2)) preserves SIREN's unit-variance
+    pre-activation invariant across deep trunks. W2 and b2 are zero-initialized so gate == 1.0
+    identically at step 0.
     """
 
-    def __init__(self, out_feat: int, lat_feat: int = 0, reduction: int = 8):
+    def __init__(self, out_feat: int, lat_feat: int = 0, reduction: int = 8, max_delta: float = 0.2):
         super().__init__()
         self.out_feat = int(out_feat)
         self.lat_feat = int(lat_feat)
+        self.max_delta = float(max_delta)
         in_dim = self.out_feat + self.lat_feat
         bottleneck = max(self.out_feat // max(int(reduction), 1), 16)
 
@@ -237,7 +264,7 @@ class ChannelRecalibration(nn.Module):
         self.act = nn.SiLU(inplace=True)
         self.fc2 = nn.Linear(bottleneck, self.out_feat, bias=True)
 
-        # Zero-init final projection -> gate = 1 + tanh(0) = 1.0 at step 0
+        # Zero-init final projection -> gate = 1 + max_delta * tanh(0) = 1.0 at step 0
         nn.init.zeros_(self.fc2.weight)
         nn.init.zeros_(self.fc2.bias)
 
@@ -247,5 +274,5 @@ class ChannelRecalibration(nn.Module):
         else:
             ctx = h
         delta = self.fc2(self.act(self.fc1(ctx)))
-        gate = 1.0 + torch.tanh(delta)
+        gate = 1.0 + self.max_delta * torch.tanh(delta)
         return h * gate
