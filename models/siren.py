@@ -2,12 +2,14 @@ import numpy as np
 import torch
 from torch import nn
 from models.omega_scheduler import get_omega_schedule
+from models.attention import ChannelRecalibration
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class SineLayer(nn.Module):
-    def __init__(self, in_feat, lat_feat, out_feat, bias=True, is_first=False, omega=30):
+    def __init__(self, in_feat, lat_feat, out_feat, bias=True, is_first=False, omega=30,
+                 channel_recal=False, channel_recal_reduction=8):
         super().__init__()
         self.omega = omega
         self.is_first = is_first
@@ -15,6 +17,10 @@ class SineLayer(nn.Module):
         self.out_features = out_feat
         self.linear = nn.Linear(in_feat, out_feat, bias=bias)
         self.linear_lats = nn.Linear(lat_feat, out_feat * 2, bias=bias) if lat_feat > 0 else None
+        self.channel_recal = (
+            ChannelRecalibration(out_feat, lat_feat, reduction=channel_recal_reduction)
+            if channel_recal else None
+        )
         self.init_weights()
 
     def init_weights(self):
@@ -36,6 +42,8 @@ class SineLayer(nn.Module):
             out = torch.sin((self.omega * intermed * lats[..., :self.out_features]) + lats[..., self.out_features:])
         else:
             out = torch.sin(self.omega * intermed)
+        if self.channel_recal is not None:
+            out = self.channel_recal(out, input[1])
         return out, input[1]
 
 
@@ -45,17 +53,22 @@ class Siren(nn.Module):
                  outermost_linear, modulated_layers,
                  seg_head_num_layers=0, seg_head_hidden_size=0, seg_head_use_last_features=False,
                  seg_branch_activate=False, seg_branch_num_layers=2, seg_branch_hidden_size=256,
-                 seg_branch_layer=-1, seg_branch_modulate=True, shared_output_layer=False):
+                 seg_branch_layer=-1, seg_branch_modulate=True, shared_output_layer=False,
+                 channel_recal_activate=False, channel_recal_reduction=8):
     # def __init__(self, in_size, lat_size, out_size, hidden_size, num_layers, omega_0, omega_start, omega_end, schedule_type,
     #             outermost_linear, modulated_layers):
         super().__init__()
         l_in_mod = 0 in modulated_layers
         omegas = get_omega_schedule(omega_0, omega_start, omega_end, num_layers, schedule_type)
-        self.net = [SineLayer(in_size, lat_size * l_in_mod, hidden_size, is_first=True, omega=omegas[0])]
+        self.net = [SineLayer(in_size, lat_size * l_in_mod, hidden_size, is_first=True, omega=omegas[0],
+                              channel_recal=channel_recal_activate,
+                              channel_recal_reduction=channel_recal_reduction)]
         self.hidden_size = hidden_size
         for i in range(num_layers):
             l_in_mod = (i+1) in modulated_layers
-            self.net.append(SineLayer(hidden_size, lat_size * l_in_mod, hidden_size, is_first=False, omega=omegas[i+1]))
+            self.net.append(SineLayer(hidden_size, lat_size * l_in_mod, hidden_size, is_first=False, omega=omegas[i+1],
+                                      channel_recal=channel_recal_activate,
+                                      channel_recal_reduction=channel_recal_reduction))
 
         # if outermost_linear:
         #    self.final_linear = nn.Linear(hidden_size+lat_size, out_size, bias=True)
@@ -93,7 +106,9 @@ class Siren(nn.Module):
             for _ in range(int(seg_branch_num_layers)):
                 self.seg_branch_layers.append(
                     SineLayer(prev, lat_size if self.seg_branch_modulate else 0,
-                              seg_branch_hidden_size, is_first=False, omega=branch_omega))
+                              seg_branch_hidden_size, is_first=False, omega=branch_omega,
+                              channel_recal=channel_recal_activate,
+                              channel_recal_reduction=channel_recal_reduction))
                 prev = seg_branch_hidden_size
 
         if self.shared_output:

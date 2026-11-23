@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from models.siren import Siren
+from models.attention import LatentSpatialAttention
 from models.encodings import get_encoding, TimeEncoding, ConditionEncoding, IdentityEncoding, get_condition_encoding
 from utils import embed2affine
 from scipy.ndimage import label
@@ -22,6 +23,30 @@ class INR_Decoder(nn.Module):
         self.mod_dim = args_inr['hidden_size'] * len(args_inr['modulated_layers']) * 2
         self.modulator = Modulator(args_inr['latent_dim'], kernel_size=args_inr['cnn_kernel_size'])
         self.arch = args_inr.get('architecture', 'siren')
+
+        # Optional INRAM-inspired Spatial Recombination Attention on the regular latent grid
+        la_cfg = args_inr.get('latent_attention', {}) or {}
+        if isinstance(la_cfg, bool):
+            la_cfg = {'activate': la_cfg}
+        if la_cfg.get('activate', False):
+            self.latent_attention = LatentSpatialAttention(
+                channels=args_inr['latent_dim'][0],
+                num_layers=la_cfg.get('num_layers', 1),
+                num_heads=la_cfg.get('num_heads', 8),
+                ffn_mult=la_cfg.get('ffn_mult', 2.0),
+                dropout=la_cfg.get('dropout', 0.0),
+                use_ffn=la_cfg.get('use_ffn', True),
+                use_pos_embed=la_cfg.get('use_pos_embed', True),
+            )
+        else:
+            self.latent_attention = nn.Identity()
+
+        # Optional INRAM-inspired pointwise Channel Recalibration Attention in SIREN layers
+        cr_cfg = args_inr.get('channel_recalibration', {}) or {}
+        if isinstance(cr_cfg, bool):
+            cr_cfg = {'activate': cr_cfg}
+        channel_recal_activate = bool(cr_cfg.get('activate', False))
+        channel_recal_reduction = int(cr_cfg.get('reduction', 8))
 
         # Initialise Coordinate Encoding
         self.encoding = get_encoding(args_inr, args.get('encoding'))
@@ -97,26 +122,27 @@ class INR_Decoder(nn.Module):
                             seg_branch_hidden_size=args_inr.get('seg_branch', {}).get('hidden_size', 256),
                             seg_branch_layer=args_inr.get('seg_branch', {}).get('branch_layer', -1),
                             seg_branch_modulate=args_inr.get('seg_branch', {}).get('modulate', True),
-                            shared_output_layer=args_inr.get('shared_output_layer', False))
+                            shared_output_layer=args_inr.get('shared_output_layer', False),
+                            channel_recal_activate=channel_recal_activate,
+                            channel_recal_reduction=channel_recal_reduction)
 
-    def forward(self, coords, latent_vecs, condition_vecs, idcs_df=None, time_vals=None):
+    def encode_latent_grids(self, latent_grids):
+        """Apply CNN modulator and optional spatial self-attention to active latent grids."""
+        return self.latent_attention(self.modulator(latent_grids))
+
+    def forward(self, coords, latent_vecs, condition_vecs, idcs_df=None, time_vals=None,
+                precomputed_modulations=None):
         """
         Args:
             coords: (N, 2) for 2D or (N, 3) for 3D
-            latent_vecs: (N, l_channels, l_x, l_y) for 2D or (N, l_channels, l_x, l_y, l_z) for 3D 
+            latent_vecs: (N_subjects, l_channels, *spatial)
             condition_vecs: (N, c_channels)
-            idcs_df: mapping to batch index
+            idcs_df: mapping to subject index in latent_vecs
             time_vals: (N, 1) or (N, C_time) temporal coordinate
-            flips: boolean tensor indicating if spatial latent coordinates are horizontally flipped
+            precomputed_modulations: optional pre-encoded latent grids (e.g. cached across inference chunks)
         """
         # Apply Coordinate Encoding (e.g. Fourier, HashGrid), spatial only
         coords_enc = self.encoding(coords)
-
-        # Compute the modulated latent grids for all subjects (small: N_subjects, C, *spatial).
-        # NOTE: we deliberately do NOT gather per-sample grids (i.e. self.modulator(latent_vecs)[idcs_df])
-        # here, because that materialises an (n_samples, C, H, W) tensor and blows up memory with
-        # higher-resolution latent grids. Instead we interpolate per subject inside _interpolate_latents.
-        modulations = self.modulator(latent_vecs)
 
         # --- Standard: concatenate everything ---
         # Append encoded time if enabled
@@ -127,9 +153,25 @@ class INR_Decoder(nn.Module):
         # Apply Fourier encoding to conditioning variables
         condition_vecs_enc = self.cond_encoding(condition_vecs)
 
-        # Sample each coordinate's latent from its subject's grid (memory-efficient), then
-        # concatenate the conditioning variables (latents + conditions).
-        latents_interp = self._interpolate_latents(coords, modulations, idcs_df)
+        # Sample each coordinate's latent from its subject's grid (memory-efficient).
+        # Gather ONLY active subjects in this batch before running modulator + spatial attention,
+        # avoiding O(N_subjects_total) compute/VRAM when the full latent bank is passed in.
+        if precomputed_modulations is not None:
+            latents_interp = self._interpolate_latents(coords, precomputed_modulations, idcs_df)
+        elif idcs_df is None:
+            active_mods = self.encode_latent_grids(latent_vecs[:1])
+            latents_interp = self._interpolate_latents(coords, active_mods, None)
+        else:
+            idcs_flat = idcs_df.reshape(-1).long()
+            unique_subs, inverse_idcs = torch.unique(idcs_flat, return_inverse=True)
+            if unique_subs.numel() == 1:
+                s = int(unique_subs.item())
+                active_mods = self.encode_latent_grids(latent_vecs[s:s + 1])
+                latents_interp = self._interpolate_latents(coords, active_mods, None)
+            else:
+                active_mods = self.encode_latent_grids(latent_vecs[unique_subs])
+                latents_interp = self._interpolate_latents(coords, active_mods, inverse_idcs)
+
         modulations_interp = torch.cat((latents_interp, condition_vecs_enc), dim=-1)
 
         # v2: append per-coordinate anchor features (FAF + baseline mask), sampled from the
@@ -161,7 +203,7 @@ class INR_Decoder(nn.Module):
         Args:
             coords:      (n_samples, dim) normalised to [-1, 1]
             modulations: (N_subjects, C, H, W) for 2D or (N_subjects, C, D, H, W) for 3D
-            idcs_df:     (n_samples,) subject index per coordinate
+            idcs_df:     (n_samples,) subject index per coordinate, or None (all from index 0)
         Returns:
             (n_samples, C) interpolated latent vectors.
         """
@@ -169,7 +211,20 @@ class INR_Decoder(nn.Module):
         n_channels = modulations.shape[1]
 
         if idcs_df is None:
-            idcs_df = torch.zeros(coords.shape[0], dtype=torch.long, device=coords.device)
+            grid_s = modulations[0:1]
+            if spatial_dim == 2:
+                grid = coords[None, :, None, :2]
+                sampled = F.grid_sample(grid_s, grid, mode='bilinear',
+                                        align_corners=True, padding_mode='border')
+                return sampled[0, :, :, 0].t()
+            elif spatial_dim == 3:
+                grid = coords[None, :, None, None, :3]
+                sampled = F.grid_sample(grid_s, grid, mode='bilinear',
+                                        align_corners=True, padding_mode='border')
+                return sampled[0, :, :, 0, 0].t()
+            else:
+                raise ValueError(f"Unsupported latent grid dimensionality: {spatial_dim}D")
+
         idcs_df = idcs_df.reshape(-1).long()
 
         out = torch.empty((coords.shape[0], n_channels), device=modulations.device, dtype=modulations.dtype)
@@ -209,12 +264,17 @@ class INR_Decoder(nn.Module):
         #    tfs_expanded = tfs.expand(coords.shape[0], -1)
         #    coords = self.transform(coords, tfs_expanded)
 
+        # Precompute modulated + spatially attended latent grid ONCE across all coordinate chunks
+        precomputed_mods = self.encode_latent_grids(latent_vec)
+
         for i in range(0, coords.shape[0], step_size):
             c = coords[i:i + step_size]
-            idcs_df = torch.zeros(c.shape[0], dtype=torch.long, device=self.device)
             cv = condition_vec.expand(c.shape[0], -1)
             tv = time_val.expand(c.shape[0], -1) if (self.time_as_input and time_val is not None) else None
-            output[i:i + step_size] = self.forward(c, latent_vec, cv, idcs_df=idcs_df, time_vals=tv)
+            output[i:i + step_size] = self.forward(
+                c, latent_vec, cv, idcs_df=None, time_vals=tv,
+                precomputed_modulations=precomputed_mods,
+            )
 
         imgs = torch.clamp(output[..., :self.sr_dims], 0, 1)
         # (a) Per-image, per-SR-channel min-max renormalization to [0,1] (the original GAP-INR
