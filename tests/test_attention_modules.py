@@ -256,10 +256,12 @@ def test_chunked_inference_equivalence(device):
 
 def test_yaml_configs_and_backward_compat(device):
     baseline_cfgs = [
+        "configs/config_model.yaml",
         "configs/config_model_macustar_faf.yaml",
         "configs/config_model_faf_slo_ga.yaml",
     ]
     attn_cfgs = [
+        "configs/config_model_attention.yaml",
         "configs/config_model_macustar_faf_attention.yaml",
         "configs/config_model_faf_slo_ga_attention.yaml",
     ]
