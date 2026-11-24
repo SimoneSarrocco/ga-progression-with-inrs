@@ -8,7 +8,7 @@ from datetime import datetime
 # Import ModelBuilder
 from build_model import ModelBuilder
 from data_loading.dataset import validate_splits
-from utils import reconstruction_modalities, validate_modality_config
+from utils import reconstruction_modalities, segmentation_modality, validate_modality_config
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GAP-INR Standalone Validation & Evaluation Script")
@@ -268,19 +268,15 @@ def main():
         print("\nRunning validation/evaluation routine...")
         model_builder.validate(epoch_train=chkp_epoch)
 
-    # Paper-ready leave-one-out summary (held-out DICE/PSNR/SSIM/IoU mean±SE, interp vs
-    # extrapolation, lesion-area MAE) from the metric JSONs just written.
+    # Held-out metric summary from the JSONs just written. GA-growth buckets are added only when
+    # the dataset actually has a segmentation modality.
     try:
         import subprocess, sys
         here = os.path.dirname(os.path.abspath(__file__))
         cmd = [sys.executable, os.path.join(here, "summarise_eval.py"),
                "--eval_dir", args["output_dir"]]
-        # Pass the frozen data CSV so summarise_eval also emits the minor/major GA-growth buckets
-        # (ImageFlowNet framing). Growth uses the CANONICAL 620->512 mask grid (summarise_eval's
-        # defaults), identical to the ImageFlowNet baselines' eval_faf_ga.py, so the buckets are method-independent -- regardless of
-        # whether this GAP-INR run itself scores at 620 or 512.
         _csv = (args.get("dataset") or {}).get("tsv_file")
-        if _csv:
+        if _csv and segmentation_modality(args) is not None:
             cmd += ["--data_csv", _csv]
         subprocess.run(cmd, check=False)
     except Exception as e:

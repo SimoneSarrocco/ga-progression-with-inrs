@@ -8,8 +8,11 @@ paths (`./data/...`) to your own data before running them.
 |---|---|
 | `enrich_clinical_data.py` | Merges per-scan physical-scale metadata (SLO scan-info) into the longitudinal clinical CSV. |
 | `add_split_column.py` | Adds a patient-wise `split` column (train/val/test) so no eye leaks across splits. |
+| `prepare_macustar_faf.py` | Builds reconstruction-only MACUSTAR metadata from the validated survival table and master ages, preserving patient splits and resolving age gaps. Also writes `expected_split_macustar.yaml`. It reads registered FAF from `enhanced_registered_multimodal` and does not include survival labels. |
+| `analyze_macustar_biomarker_survival.py` | Extracts the 15 total OCT biomarker volumes from the registered-branch JSON files and fits baseline study-eye Cox models for late-AMD progression. Reports presence and log-volume hazard ratios with age/sex adjustment, baseline-AMD stratification, and within-family FDR correction. |
+| `extract_macustar_biomarker_volumes.py` | Extracts all 15 total volumes for every available study and fellow eye visit into `biomarker_volumes_all_visits.csv`, checks each volume against voxel count × voxel volume, and records missing/invalid JSON files. The companion RStudio workflow is `../analysis/macustar_biomarker_cox.R`. |
 
-These are **not** a pipeline to run against a CSV you already have, and they are destructive:
+The two OMEGA scripts below are **not** a pipeline to run against a CSV you already have, and they are destructive:
 
 - `enrich_clinical_data.py` reads `./data/clinical_metadata_raw.csv` (a raw export, not shipped) and
   writes `./data/clinical_metadata.csv`, adding the physical pixel-scale columns (`ScaleXSlo`,

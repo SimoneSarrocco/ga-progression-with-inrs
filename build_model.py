@@ -68,10 +68,10 @@ class ModelBuilder:
         # Anchor tensors for the TTA latent regulariser (set per split in _init_validation):
         # None -> regularise towards 0 (random init); tensor -> regularise towards that prior.
         self._latent_anchor = {}
-        # Best-checkpoint selection on the held-out (val-eval) DICE.
+        # Held-out DICE and reconstruction(+segmentation) loss are both tracked; validation
+        # configuration selects which one defines checkpoint_best.pth.
         self.best_val_dice = -float('inf')
         self.best_val_epoch = -1
-        # Parallel selection on the held-out combined LOSS (recon + seg in one number).
         self.best_val_loss = float('inf')
         self.best_val_loss_epoch = -1
         if self.args['epochs']['train'] > 0:
@@ -173,10 +173,10 @@ class ModelBuilder:
 
     def _load_best_decoder(self):
         """Load decoder weights (and the matching training latents) from 'checkpoint_best.pth' into
-        the 'train' split so the test pass uses the best (by val-eval DICE) checkpoint. The latents
-        matter for val_latent_init 'population_mean' / 'nearest_train', which read them. Falls back to
-        the current in-memory weights if the file is missing (e.g. save_model: false, or evaluate.py,
-        which already loaded the requested checkpoint)."""
+        the 'train' split so the test pass uses the checkpoint selected by validation DICE or loss.
+        The latents matter for val_latent_init 'population_mean' / 'nearest_train', which read them.
+        Falls back to the current in-memory weights if the file is missing (e.g. save_model: false,
+        or evaluate.py, which already loaded the requested checkpoint)."""
         best_path = os.path.join(self.args['output_dir'], 'checkpoint_best.pth')
         if not os.path.exists(best_path):
             print(f"[test] No checkpoint_best.pth at {best_path}; using current decoder weights "
@@ -191,8 +191,8 @@ class ModelBuilder:
     def test(self):
         """Final evaluation on the held-out test set with the best training checkpoint.
 
-        Mirrors a validation round but on the 'test' split: load the best decoder (selected by
-        val-eval DICE), optimise a fresh latent per test patient-eye on its acquired (non-held-out)
+        Mirrors a validation round but on the 'test' split: load the decoder selected by the
+        configured validation metric, optimise a fresh latent per test patient-eye on its acquired (non-held-out)
         visits, evaluate on the held-out visit, then generate future-state predictions. Single-visit
         test eyes are optimised on their lone visit (clinical deployment) and only get predictions.
         """
@@ -615,7 +615,15 @@ class ModelBuilder:
         """
         validation_cfg = self.args.get('validation', {})
         train_eval_every = validation_cfg.get('train_eval_every', 1)
-        
+        has_seg = self.args['inr_decoder']['out_dim'][-1] > 0
+        selection_metric = validation_cfg.get(
+            'selection_metric', 'dice' if has_seg else 'loss'
+        ).lower()
+        if selection_metric not in ('dice', 'loss'):
+            raise ValueError("validation.selection_metric must be 'dice' or 'loss'")
+        if selection_metric == 'dice' and not has_seg:
+            raise ValueError("Dice checkpoint selection requires a segmentation output; use 'loss'.")
+
         is_train_eval_epoch = (epoch_train + 1) % train_eval_every == 0 or (epoch_train + 1) == self.args['epochs']['train']
         is_val_epoch = ((epoch_train + 1) % self.args['validate_every'] == 0 or (epoch_train + 1) == self.args['epochs']['train']) and validation_cfg.get('activate', True)
 
@@ -692,6 +700,9 @@ class ModelBuilder:
             holdout_cfg = self.args.get('validation', {})
             strategy = holdout_cfg.get('holdout_strategy', 'last')
             val_df = self.datasets['val'].df
+            if val_df.empty:
+                print("[val] No eyes with enough valid visits for evaluation; skipping validation.")
+                return
             picked_val_subs = sorted(val_df['sub_id_int'].unique())
 
             # Collect the held-out DICE from each round; its mean is the checkpoint-selection signal.
@@ -773,27 +784,25 @@ class ModelBuilder:
         if is_val_epoch:
             self.save_state(epoch_train)
 
-            # Best-checkpoint selection on the held-out (val-eval) DICE: this measures
-            # longitudinal generalisation and is independent of the inner-loop early stopping
-            # (which only decides when to stop optimising a given latent). The decoder weights
-            # live on the 'train' split, so we snapshot that split as 'checkpoint_best.pth'.
+            # Track both generalisation signals. validation.selection_metric chooses which one writes
+            # checkpoint_best.pth and drives the final test decoder; the other remains available as an
+            # auxiliary checkpoint and TensorBoard curve.
             val_eval_dice = getattr(self, '_last_val_eval_dice', None)
             if val_eval_dice is not None:
                 if val_eval_dice > self.best_val_dice:
                     self.best_val_dice = val_eval_dice
-                    self.best_val_epoch = epoch_train
-                    self.save_state(epoch_train, split='train', filename='checkpoint_best.pth')
-                    print(f"[checkpoint] New best val-eval DICE {val_eval_dice:.4f} at epoch {epoch_train} "
-                          f"-> saved checkpoint_best.pth")
-                else:
+                    if selection_metric == 'dice':
+                        self.best_val_epoch = epoch_train
+                        self.save_state(epoch_train, split='train', filename='checkpoint_best.pth')
+                        print(f"[checkpoint] New best val-eval DICE {val_eval_dice:.4f} at epoch {epoch_train} "
+                              f"-> saved checkpoint_best.pth")
+                elif selection_metric == 'dice':
                     print(f"[checkpoint] val-eval DICE {val_eval_dice:.4f} (best {self.best_val_dice:.4f} "
                           f"@ epoch {self.best_val_epoch}); keeping previous best.")
                 if tb_writer is not None:
                     tb_writer.add_scalar("val/eval_dice_mean", val_eval_dice, epoch_train)
                     tb_writer.add_scalar("val/best_eval_dice", self.best_val_dice, epoch_train)
 
-            # Parallel best-checkpoint on the held-out combined LOSS (recon + seg). Saved alongside
-            # checkpoint_best.pth so the user can select a config by val-DICE OR val-loss.
             val_eval_loss = getattr(self, '_last_val_loss', None)
             if val_eval_loss is not None:
                 if val_eval_loss < self.best_val_loss:
@@ -1854,7 +1863,8 @@ class ModelBuilder:
                     self._eval_sets = {}
                 self._eval_sets[f'{split}_eval'] = eval_data
             log_metrics(self.args, metrics_eval, epoch_train, split=f'{split}_eval_{tag_suffix}', tb_writer=tb_writer)
-            self._log_reconstruction_figures(eval_data, split, epoch_train, tb_writer, tensorboard_tag=f'{split}_eval_{tag_suffix}')
+            if save_figs:
+                self._log_reconstruction_figures(eval_data, split, epoch_train, tb_writer, tensorboard_tag=f'{split}_eval_{tag_suffix}')
             # Held-out reconstruction loss (generalisation): computed with the optimised,
             # frozen latents, same seg_weight as the opt loss so the curves are comparable.
             eval_loss = self._compute_loss_on_visits(eval_idcs, split=split)
@@ -1863,7 +1873,7 @@ class ModelBuilder:
                          log=self.args['logging'], tb_writer=tb_writer)
 
         # Generate and log publication-ready summary figure
-        if self.args['dataset'].get('dataset_name') == 'faf_ga':
+        if save_figs and self.args['dataset'].get('dataset_name') == 'faf_ga':
             val_data_combined = {}
             if opt_data:
                 val_data_combined.update(opt_data)
@@ -1998,8 +2008,9 @@ class ModelBuilder:
 
                 # Per-visit scalars computed ONCE and reused by every figure (single source of truth)
                 modalities = self.args['dataset']['modalities']
-                pred_seg = res_imgs[segmentation_modality(self.args)].get('pred') if len(modalities) > 1 else None
-                gt_seg = res_imgs[segmentation_modality(self.args)].get('ref') if len(modalities) > 1 else None
+                seg_modality = segmentation_modality(self.args)
+                pred_seg = res_imgs[seg_modality].get('pred') if seg_modality is not None else None
+                gt_seg = res_imgs[seg_modality].get('ref') if seg_modality is not None else None
 
                 # Lesion sizes in mm^2 = (#GA pixels on the sampling grid) * ScaleXSlo * ScaleYSlo * rf.
                 # ScaleXSlo/ScaleYSlo are mm/px at NATIVE resolution. faf_ga_620 samples the native-pitch
@@ -2965,12 +2976,14 @@ class ModelBuilder:
         weeks_grid = ((norm_grid + 1.0) / 2.0) * (c_max - c_min) + c_min
 
         grid_coords, grid_shape = generate_world_grid(self.args, device=self.device)
-        label_names = self.args['dataset'].get('label_names', [])
-        # GA class index in the seg output. Accept the configured name ('GeographicAtrophy') or the
-        # short alias ('GA'); fall back to the last seg class if neither is present.
-        ga_aliases = ('GeographicAtrophy', 'GA')
-        ga_label = next((label_names.index(a) for a in ga_aliases if a in label_names),
-                        self.args['inr_decoder']['out_dim'][-1] - 1)
+        n_seg_channels = self.args['inr_decoder']['out_dim'][-1]
+        has_seg = n_seg_channels > 0
+        ga_label = None
+        if has_seg:
+            label_names = self.args['dataset'].get('label_names', [])
+            ga_aliases = ('GeographicAtrophy', 'GA')
+            ga_label = next((label_names.index(a) for a in ga_aliases if a in label_names),
+                            n_seg_channels - 1)
 
         self.inr_decoder[split].eval()
         faf_maps, ga_areas = [], []
@@ -2984,15 +2997,18 @@ class ModelBuilder:
                 )
                 faf = out[..., :sr_dims].detach().float().cpu().numpy()
                 faf_maps.append(faf)
-                seg_hard = out[..., sr_dims].detach().float().cpu().numpy()
-                ga_areas.append(float((seg_hard == ga_label).sum()))
+                if has_seg:
+                    seg_hard = out[..., sr_dims].detach().float().cpu().numpy()
+                    ga_areas.append(float((seg_hard == ga_label).sum()))
 
         # FAF sensitivity: mean |ΔFAF| between consecutive time points (per pixel, per step).
         faf_diffs = [np.mean(np.abs(faf_maps[i + 1] - faf_maps[i])) for i in range(len(faf_maps) - 1)]
         faf_sensitivity = float(np.mean(faf_diffs)) if faf_diffs else 0.0
-        ga_min, ga_max = (min(ga_areas), max(ga_areas)) if ga_areas else (0.0, 0.0)
-
         tb_writer.add_scalar("condition_probe/faf_mean_abs_diff_per_step", faf_sensitivity, epoch_train)
+        if not has_seg:
+            print(f"[condition_probe] Epoch {epoch_train}: FAF sensitivity/step = {faf_sensitivity:.6f}")
+            return
+        ga_min, ga_max = (min(ga_areas), max(ga_areas)) if ga_areas else (0.0, 0.0)
         tb_writer.add_scalar("condition_probe/ga_area_range_px", ga_max - ga_min, epoch_train)
         tb_writer.add_scalar("condition_probe/ga_area_min_px", ga_min, epoch_train)
         tb_writer.add_scalar("condition_probe/ga_area_max_px", ga_max, epoch_train)

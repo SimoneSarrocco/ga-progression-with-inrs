@@ -276,6 +276,35 @@ apply the same factor for their grid.
 
 ---
 
+## 8. MACUSTAR registered FAF without segmentation
+
+`macustar_faf_512` is a reconstruction-only section with `modalities: ['faf_path']` and
+`out_dim: [1, 0]`. Its metadata is built by:
+
+```bash
+python preprocessing/prepare_macustar_faf.py
+```
+
+The builder reads `macustar_metadata_surv_days.csv` from the sibling survival repository, preserves its
+patient-wise train/val/test split, joins `Age_at_visit` from the master MACUSTAR CSV, and fills missing
+ages with `age_at_baseline + image_time_days / 365.25`. Survival outcomes are not copied into the new
+CSV. Every path must name `registered_faf_{Visit_ID}_{Eye_Laterality}.nii.gz` under the
+`enhanced_registered_multimodal` branch and exist locally.
+
+The generated `data/macustar_faf_metadata.csv` contains `Eye_ID`, `Patient_ID`, `Eye`, `Visit_ID`,
+`Visit_Number`, `Visit_date`, `AgeatVisit`, `faf_path`, `diff`, and `split`.
+`configs/expected_split_macustar.yaml` is generated alongside it and selected through the dataset's
+`expected_split` key.
+
+Registered NIfTI files are squeezed to 2-D and transposed into row/column orientation before the normal
+geometry and normalisation steps. The default configuration resizes the full 768×768 field of view to
+512×512, uses actual visit dates for weeks-from-baseline (0–210 weeks), and does not flip left eyes.
+There are no mask-grader, class-weight, or lesion-analysis settings. Checkpoint selection uses held-out
+FAF loss (`validation.selection_metric: loss`). `train_coordinates_per_visit: 20000` limits training
+sampling only; evaluation remains dense.
+
+---
+
 ## 9. Building the CSV from scratch (optional helpers)
 
 The `preprocessing/` scripts document how the paper's CSV was assembled from a raw export. They are

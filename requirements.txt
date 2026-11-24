@@ -10,8 +10,11 @@ torchvision
 numpy>=1.22
 scipy>=1.10
 pandas>=1.5
+lifelines>=0.30
+openpyxl>=3.1
 scikit-image>=0.20
 Pillow>=9.0
+nibabel>=5.0
 
 # Experiment Tracking and Logging
 wandb>=0.15

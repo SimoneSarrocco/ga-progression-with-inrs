@@ -97,6 +97,27 @@ remains the reconstruction-only ablation. Evaluation reports `FAF_PSNR`/`FAF_SSI
 the corresponding `SLO_*` metrics separately. Unqualified PSNR/SSIM/LPIPS remain FAF aliases for
 backward compatibility; the combined `LOSS` uses all training reconstruction channels.
 
+## MACUSTAR registered-FAF reconstruction
+
+`configs/config_model_macustar_faf.yaml` adapts the same longitudinal INR to MACUSTAR without a
+segmentation target or survival labels. The starting cohort is the validated at-risk table from
+`interpretable-deep-survival-analysis`: 2,317 visits from 466 patient-eyes, with patient-wise splits.
+Only `registered_faf_{Visit_ID}_{Eye_Laterality}.nii.gz` from `enhanced_registered_multimodal` is used.
+
+Generate the GAP-INR metadata and split guard, then train:
+
+```bash
+python preprocessing/prepare_macustar_faf.py
+python run.py --config_model configs/config_model_macustar_faf.yaml
+```
+
+The model has `out_dim: [1, 0]`, optimises FAF MSE only, selects `checkpoint_best.pth` by held-out FAF
+loss, and evaluates PSNR/SSIM/LPIPS. Full 768×768 registered images resize to a 512×512 INR grid without
+the OMEGA-specific 620 crop. Training samples 20,000 coordinates per visit and epoch; dense evaluation
+still renders the full grid. NIfTI images are transposed into row/column orientation consistently in
+training and evaluation. To use another cohort, replace `tsv_file` and its dataset-specific
+`expected_split` file.
+
 ---
 
 ## Repository layout

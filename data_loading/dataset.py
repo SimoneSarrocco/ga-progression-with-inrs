@@ -107,10 +107,13 @@ def validate_splits(args, verbose=True):
 
     # 5. Canonical-split guard. Disjointness (step 1) does NOT catch a wrong-but-disjoint
     # partition (e.g. a stale CSV with 30 train eyes and no test split, which silently
-    # contaminated a whole sweep). If configs/expected_split.yaml exists, the resolved eyes
-    # MUST match it exactly, or we abort before any training/eval starts.
-    exp_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            'configs', 'expected_split.yaml')
+    # contaminated a whole sweep). A dataset can provide its own expected_split file; otherwise
+    # the historical OMEGA file remains the default.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exp_path = ds.get('expected_split') or os.path.join(repo_root, 'configs', 'expected_split.yaml')
+    if not os.path.isabs(exp_path):
+        exp_path = os.path.join(repo_root, exp_path)
+    exp_path = os.path.normpath(exp_path)
     if os.path.exists(exp_path):
         with open(exp_path) as f:
             exp = (yaml.safe_load(f) or {}).get('splits', {})
@@ -125,12 +128,12 @@ def validate_splits(args, verbose=True):
                              f"missing={sorted(missing)} extra={sorted(extra)}")
         if diffs:
             raise ValueError(
-                "SPLIT MISMATCH vs configs/expected_split.yaml (the canonical paper split).\n"
+                f"SPLIT MISMATCH vs {exp_path}.\n"
                 + "\n".join(diffs)
                 + f"\nThe CSV in use is '{ds['tsv_file']}'. Put the correct enriched CSV in place "
-                  "(or update/delete expected_split.yaml if the split intentionally changed).")
+                  "or update the dataset's expected_split file if the split intentionally changed.")
         if verbose:
-            print("  OK: resolved split matches configs/expected_split.yaml exactly.")
+            print(f"  OK: resolved split matches {exp_path} exactly.")
     return sets
 
 
@@ -196,8 +199,8 @@ class Data(Dataset):
         if self.args['dataset'].get('dataset_name') == 'faf_ga':
             self._apply_mask_grader_mode()
 
-        self._map_subject_ids()
         self._init_data_augmentation()
+        self._map_subject_ids()
         self._compute_patient_stats()
 
     def set_epoch(self, epoch):
@@ -312,26 +315,28 @@ class Data(Dataset):
                     print(f"weeks_from_baseline constraint set from dates: [{w_min:.3f}, {w_max:.3f}]")
         return df
 
-    def _exclude_eyes_with_insufficient_visits(self):
-        """Drop eyes with fewer than `min_valid_visits_eval` valid visits from val/test.
+    def _exclude_eyes_with_insufficient_visits(self, df=None):
+        """Drop eval eyes with too few valid visits for latent fitting plus a held-out visit.
 
-        Leave-one-visit-out validation requires at least 2 visits per eye (one held out, >=1 to fit
-        the latent). Eyes with too few VALID (file-present) visits, e.g. EYE28_OS, which has only 1
-        FAF+mask visit, cannot be held out and would otherwise pollute the eval pool. self.df already
-        contains only file-present visits, so the per-eye row count is the valid-visit count.
+        When df is supplied, return the filtered frame without replacing self.df. This lets the
+        loader enforce eligibility before random eye subsampling as well as before final use.
         """
+        source = self.df if df is None else df
         min_visits = int(self.args['dataset'].get('min_valid_visits_eval', 2))
-        if min_visits <= 1 or self.df.empty:
-            return
-        counts = self.df.groupby(self.id_column)[self.id_column].transform('size')
+        if min_visits <= 1 or source.empty:
+            return source
+        counts = source.groupby(self.id_column)[self.id_column].transform('size')
         keep = counts >= min_visits
-        dropped_eyes = sorted(set(self.df.loc[~keep, self.id_column]))
+        dropped_eyes = sorted(set(source.loc[~keep, self.id_column]))
+        filtered = source[keep].reset_index(drop=True)
         if dropped_eyes:
-            per_eye = self.df[~keep].groupby(self.id_column).size().to_dict()
+            per_eye = source[~keep].groupby(self.id_column).size().to_dict()
             print(f"[{self.split}] Excluding {len(dropped_eyes)} eye(s) with <{min_visits} valid "
                   f"visits from evaluation: " +
                   ", ".join(f"{e}({per_eye[e]})" for e in dropped_eyes))
-            self.df = self.df[keep].reset_index(drop=True)
+        if df is None:
+            self.df = filtered
+        return filtered
 
     def _apply_mask_grader_mode(self):
         mode = self.args['dataset'].get('mask_grader_mode', 'single')
@@ -555,6 +560,14 @@ class Data(Dataset):
             row_dict = self.df.iloc[idx].to_dict()  # this is one row/visit of a patient-eye from the CSV file
             modalities = self.load_modalities(row_dict)  # image paths of that specific row/visit of a patient-eye
             coords, values = self.load_coords_and_values(modalities, row_dict)  # coordinates and corresponding pixel intensity values of that specific row/visit of a patient-eye
+            budget = int(self.args['dataset'].get('train_coordinates_per_visit', 0) or 0)
+            if self.split == 'train' and budget > 0 and coords.shape[0] > budget:
+                rng = np.random.default_rng([
+                    int(self.args.get('seed', 0)), int(self.epoch), int(idx),
+                    int(row_dict.get('sub_id_int', 0)),
+                ])
+                selected = rng.choice(coords.shape[0], size=budget, replace=False)
+                coords, values = coords[selected], values[selected]
             coords = torch.tensor(coords, dtype=torch.float32)
             values = torch.tensor(values, dtype=torch.float32)
             conditions = self.load_conditions(row_dict)[None, :].expand(coords.shape[0], -1)
@@ -715,31 +728,23 @@ class Data(Dataset):
             if path is None:
                 raise ValueError(f"Modality {mod_key} is empty or could not be resolved")
 
-            # Load the 2D grayscale image (PNG/BMP)
-            img = Image.open(path).convert('L') # Grayscale
-            
+            img = load_grayscale_image(path)
+
             # Resize to world_bbox ONLY if no sampling_bbox is specified. When sampling_bbox is set,
             # keep original resolution so load_coords_and_values can centre-crop exact pixels without
-            # interpolation artifacts.
-            if self.args['dataset'].get('dataset_name') == 'faf_ga':
-                is_seg_mod = mod_key == segmentation_modality(self.args)
-                resample = Image.Resampling.NEAREST if is_seg_mod else Image.Resampling.BILINEAR
-                crop_pre = self.args['dataset'].get('crop_before_resize')
-                if crop_pre is not None:
-                    # Centre-crop native (768) -> crop_pre (e.g. 620) to remove the per-visit black
-                    # registration frame while keeping ALL GA (max GA half-extent 302px -> >=604 crop),
-                    # THEN resize the crop DOWN to world_bbox (e.g. 512). Lets the whole baseline
-                    # comparison run at 512 with no GA clipping and no upsampling (a direct 512 crop
-                    # would clip GA in 5/133 visits). NEAREST on the mask keeps it binary.
-                    cw, ch = int(crop_pre[0]), int(crop_pre[1])
-                    W, H = img.size  # PIL: (width, height)
-                    left, top = (W - cw) // 2, (H - ch) // 2
-                    img = img.crop((left, top, left + cw, top + ch))
-                    img = img.resize(tuple(self.args['dataset']['world_bbox'][:2]), resample)
-                elif self.args['dataset'].get('sampling_bbox') is None:
-                    # Ensure we only use 2D dimensions for PIL resize (width, height)
-                    target_size = tuple(self.args['dataset']['world_bbox'][:2])
-                    img = img.resize(target_size, resample)
+            # interpolation artifacts. Masks use nearest-neighbour resampling; images use bilinear.
+            is_seg_mod = mod_key == segmentation_modality(self.args)
+            resample = Image.Resampling.NEAREST if is_seg_mod else Image.Resampling.BILINEAR
+            crop_pre = self.args['dataset'].get('crop_before_resize')
+            if crop_pre is not None:
+                cw, ch = int(crop_pre[0]), int(crop_pre[1])
+                W, H = img.size  # PIL: (width, height)
+                left, top = (W - cw) // 2, (H - ch) // 2
+                img = img.crop((left, top, left + cw, top + ch))
+                img = img.resize(tuple(self.args['dataset']['world_bbox'][:2]), resample)
+            elif self.args['dataset'].get('sampling_bbox') is None:
+                target_size = tuple(self.args['dataset']['world_bbox'][:2])
+                img = img.resize(target_size, resample)
             
             # Canonicalize laterality (DETERMINISTIC, not augmentation): mirror LEFT (OS) eyes to
             # RIGHT (OD) orientation so the WHOLE dataset shares one orientation. Applied to every
@@ -1136,6 +1141,8 @@ class Data(Dataset):
         df = self.sample_subject_ids(df)
         df = self.remove_missing_modalities(df)
         df = self.check_constraints(df)
+        if self.split in ('val', 'test'):
+            df = self._exclude_eyes_with_insufficient_visits(df)
         df = self.sample_subjects(df)
         print("Sampled ", len(df), " subjects for split ", self.split, "\n")
         print("--------------------------------")

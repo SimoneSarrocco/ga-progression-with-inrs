@@ -15,6 +15,12 @@ faf_ga:
     val: []
     test: []
 
+macustar_faf:
+  subject_ids:
+    train: []
+    val: []
+    test: []
+
 # --- Template: how to define an explicit split for a custom cohort ---
 # my_cohort:
 #   subject_ids:

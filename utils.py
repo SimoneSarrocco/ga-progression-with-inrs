@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from skimage.metrics import structural_similarity as ssim_metric
 from skimage.metrics import hausdorff_distance
+from data_loading.image_io import load_grayscale_image
 
 # ---- LPIPS perceptual metric (lazy, optional) -------------------------------------------------
 # LPIPS is a learned perceptual distance (lower = more similar) -- complements PSNR/SSIM, which the
@@ -938,18 +939,15 @@ def compute_metrics(
             
         img_dict[mod] = mod_imgs
 
-    # Combined held-out LOSS: a SINGLE trade-off number that incorporates BOTH the segmentation
-    # and the reconstruction quality, so a checkpoint/config can be selected on it directly (the
-    # user-requested "validation loss") in addition to the held-out DICE. Composition mirrors the
-    # training loss: seg term (1 - GA Dice) + recon_weight * recon MSE. MSE is recovered from PSNR
-    # (data_range=1 -> MSE = 10^(-PSNR/10)). Lower is better.
+    # Held-out objective: reconstruction MSE recovered from PSNR, plus 1-Dice when a segmentation
+    # target exists. Reconstruction-only datasets therefore retain checkpoint selection and logging.
     recon_psnr = [value for key in recon_modalities
                   for value in metrics[f'{modality_metric_prefix(key)}_PSNR']]
-    if metrics['DICE'] and recon_psnr:
+    if recon_psnr:
         _srw = float(args['optimizer'].get('outer_sr_weight',
                                            args['optimizer'].get('sr_weight', 1.0)))
         _mse = float(np.mean([10.0 ** (-float(p) / 10.0) for p in recon_psnr]))
-        _segloss = 1.0 - float(np.mean(metrics['DICE']))
+        _segloss = 1.0 - float(np.mean(metrics['DICE'])) if metrics['DICE'] else 0.0
         metrics['LOSS'] = [float(_segloss + _srw * _mse)]
 
     if return_images:
@@ -1078,24 +1076,12 @@ def _seg_change_map(current: np.ndarray, baseline: np.ndarray) -> np.ndarray:
 
 
 def _match_geometry(data: np.ndarray, is_seg: bool, args: dict) -> np.ndarray:
-    """Apply the SAME spatial preprocessing the training dataset applies, so a GT image loaded here
-    lands on the EXACT field of view the model (and its predictions) live on.
+    """Apply the training crop/resize so reference images and predictions share a field of view.
 
-    The model is trained on coordinates normalised over the image the dataset produces. For FAF-GA the
-    dataset (data_loading/dataset.py) centre-crops native (768) -> `crop_before_resize` (e.g. 620),
-    then resizes that crop to `world_bbox` (e.g. 512), mask NEAREST / FAF BILINEAR. The SIREN's
-    [-1, 1] domain therefore spans the 620-crop FOV. If GT is loaded WITHOUT this step (native, then
-    naively centre-cropped to the prediction's pixel SHAPE) it lands on a DIFFERENT, tighter FOV
-    (the central-512 direct crop, no optic disc), so PSNR/SSIM/DICE compare misaligned fields of
-    view. Mirroring dataset.py:806-826 here keeps GT and prediction on the same FOV.
-
-    Only the geometric step is replicated (crop_before_resize -> resize, or resize-to-world_bbox when
-    no sampling_bbox). The old direct-crop path (sampling_bbox set, no crop_before_resize) keeps native
-    resolution here and is handled by the caller's existing sampling_bbox crop, so this is a no-op then.
+    With sampling_bbox set and no crop_before_resize, geometry is unchanged here and the caller
+    performs the corresponding crop. Masks use nearest-neighbour resampling; images use bilinear.
     """
     ds = args.get('dataset', {}) if args else {}
-    if ds.get('dataset_name') != 'faf_ga':
-        return data
     wb = ds.get('world_bbox')
     if not wb:
         return data
@@ -1132,7 +1118,7 @@ def load_2d_modality(path: str, is_seg: bool, patient_stats: dict = None, mod_in
     training (see `_match_geometry`). REQUIRED for any GT used in metrics/figures whenever
     `crop_before_resize` is set, else GT and prediction land on different fields of view.
     """
-    data = np.array(Image.open(path).convert('L')).astype(np.float32)
+    data = np.array(load_grayscale_image(path)).astype(np.float32)
 
     # Match the training/dataset FOV (crop_before_resize -> resize) BEFORE normalise/binarise.
     if args is not None:
@@ -1332,12 +1318,16 @@ def log_metrics(args, metrics, epoch, df=None, split='train', tb_writer=None):
             m_mean = means[i].item()
             m_std = stds[i].item()
             tag = f"{split}/{metric_key}" if mod is None else f"{split}/{mod}_{metric_key}"
-            print(f"{tag}: {m_mean:.3f} +/- {m_std:.3f}")
+            label = metric_key
+            summary_parts.append(f"{label}={m_mean:.3f}±{m_std:.3f}")
 
             if args['logging']:
                 wandb_payload[tag] = m_mean
             if tb_writer is not None:
                 tb_writer.add_scalar(tag, m_mean, epoch)
+
+    if summary_parts:
+        print(f"[{split} ep={epoch}] " + " | ".join(summary_parts))
 
     if args['logging'] and wandb_payload:
         wandb_payload[f"{split}/epoch"] = epoch
@@ -1345,7 +1335,7 @@ def log_metrics(args, metrics, epoch, df=None, split='train', tb_writer=None):
     if tb_writer is not None:
         tb_writer.flush()
 
-    # save to disk as json with proper formatting
+    # save to disk as json with proper formatting (keeps all raw keys incl. PSNR/SSIM/LPIPS aliases)
     metrics_path = os.path.join(args['output_dir'], f'{split}/{split}_metrics_ep={epoch}.json')
     os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
     with open(metrics_path, 'w') as f:
