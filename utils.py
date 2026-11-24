@@ -1271,18 +1271,23 @@ def compute_seg_overlap_metrics(pred, ref, bg_label):
 
 def log_metrics(args, metrics, epoch, df=None, split='train', tb_writer=None):
     """
-    Log metrics to wandb, TensorBoard and save to disk
-    Metrics are of the form: [metrics_sub-1, ..., metrics_sub-N] with
-    metrics_sub-i = {metric-1: [val-mod1, val-mod2, ...], metric-2: [val-mod1, val-mod2, ...]}
+    Log metrics to wandb, TensorBoard and save to disk.
+    Deduplicates unqualified PSNR/SSIM/LPIPS aliases when modality-prefixed keys
+    (e.g. FAF_PSNR, SLO_PSNR) are already present, and prints a concise summary.
+    Metrics JSON saved to disk retains all keys unchanged for downstream scripts.
     """
-    metrics_keys = ['PSNR', 'SSIM', 'LPIPS', 'DICE', 'Precision', 'Recall', 'IoU', 'HD', 'LOSS']
     modality_keys = sorted({key for entry in metrics for key in entry
                             if re.match(r'^[A-Z0-9_]+_(?:PSNR|SSIM|LPIPS)$', key)})
-    metrics_keys += [key for key in modality_keys if key not in metrics_keys]
+    has_prefixed_recon = len(modality_keys) > 0
+    metrics_keys = [] if has_prefixed_recon else ['PSNR', 'SSIM', 'LPIPS']
+    metrics_keys += modality_keys
+    metrics_keys += ['DICE', 'Precision', 'Recall', 'IoU', 'HD', 'LOSS']
+
     primary_mod = primary_reconstruction_modality(args)
     seg_mods = [segmentation_modality(args)] if segmentation_modality(args) is not None else []
     seg_metric_keys = {'DICE', 'Precision', 'Recall', 'IoU', 'HD'}
     wandb_payload = {}  # batch all (metric, modality) values into ONE wd.log call (shared step)
+    summary_parts = []
 
     for metric_key in metrics_keys:
         if metric_key in seg_metric_keys:
@@ -1332,22 +1337,17 @@ def log_metrics(args, metrics, epoch, df=None, split='train', tb_writer=None):
 
 
 def log_loss(loss, epoch, split, log=True, tb_writer=None, global_step=None):
-    """Log loss components to wandb and TensorBoard.
-    Args:
-        global_step: If provided, use this as the TensorBoard step instead of epoch.
-                     Useful for the validation inner loop to avoid overwriting steps.
-    """
+    """Log loss components to wandb and TensorBoard (deduplicating single-modality sr_* keys)."""
     def _val(v):
         return v.item() if hasattr(v, 'item') else v
 
     tb_step = global_step if global_step is not None else epoch
+    sr_subkeys = [key for key in loss if key.startswith('sr_')]
+    # Only log per-modality sr_* breakdowns when >1 reconstruction modality exists;
+    # for single-modality runs loss['sr_faf'] is identical to loss['sr'].
+    log_sr_subkeys = sr_subkeys if len(sr_subkeys) > 1 else []
 
     if log:
-        # Batch all keys into ONE wd.log call so they share a single W&B step; otherwise each
-        # wd.log() auto-increments the global step and scatters the components across steps.
-        # We do NOT pass an explicit step: call sites use different step scales (per-chunk
-        # global_steps vs per-epoch), and W&B requires a monotonically non-decreasing global
-        # step. The {split}/epoch entry can be used as a custom x-axis in the W&B UI instead.
         payload = {f"{split}/epoch": epoch}
         if 'total' in loss: payload[f"{split}/loss"] = _val(loss['total'])
         if 'sr' in loss:    payload[f"{split}/loss_sr"] = _val(loss['sr'])
@@ -1355,14 +1355,12 @@ def log_loss(loss, epoch, split, log=True, tb_writer=None, global_step=None):
         for k in ['tf_rot', 'tf_trans', 'tf_scale', 'tf']:
             if k in loss:
                 payload[f"{split}/loss_{k}"] = _val(loss[k])
-        for key, value in loss.items():
-            if key.startswith('sr_'):
-                payload[f'{split}/loss_{key}'] = _val(value)
+        for key in log_sr_subkeys:
+            payload[f'{split}/loss_{key}'] = _val(loss[key])
         wd.log(payload)
     # Log to TensorBoard
     if tb_writer is not None:
-        keys = ['total', 'sr', 'seg', 'tf', 'tf_rot', 'tf_trans', 'tf_scale']
-        keys += [key for key in loss if key.startswith('sr_')]
+        keys = ['total', 'sr', 'seg', 'tf', 'tf_rot', 'tf_trans', 'tf_scale'] + log_sr_subkeys
         for key in keys:
             if key in loss:
                 tb_writer.add_scalar(f'{split}/loss_{key}', _val(loss[key]), tb_step)

@@ -117,35 +117,45 @@ class ModelBuilder:
         )
 
     def train_on_data(self):
-        if len(self.args['load_model']['path']) > 0: self.validate(epoch_train=0)
-        loss_hist_epochs = []
-        start_time = time.time()
-        for epoch in range(self.args['epochs']['train']):
-            epoch_start = time.time()
-            if self.args['optimizer']['re_init_latents']: self.re_init_latents()
-            loss, _ = self.train_epoch(epoch, split='train')
-            loss_hist_epochs.append(loss)
-            print(
-                f"Training: Epoch: {epoch}, Loss: {loss:.4f}, AvgLoss: {np.mean(loss_hist_epochs):.4f}, "
-                f"Epoch Time: {time.time() - epoch_start:.2f}s, Total Time: {time.time() - start_time:.2f}s")
-            # Throttle image/figure logging to an every-Nth-validation cadence (disk-quota guard).
-            # Scalars still log every epoch (the wrapper only drops add_image/add_figure); the heavy
-            # per-eye image dumps fire only on image epochs (+ always the final epoch).
-            _real_writer = self.args.get('tb_writer', None)
-            _gate_images = self._images_enabled_this_epoch(epoch)
-            if _real_writer is not None:
-                self.args['tb_writer'] = _GatedImageWriter(_real_writer, _gate_images)
-            try:
-                self.validate(epoch)
-                self.run_time_sensitivity_probe(epoch)
-                self.run_condition_sensitivity_probe(epoch)
-            finally:
+        self._in_training_loop = True
+        try:
+            if len(self.args['load_model']['path']) > 0: self.validate(epoch_train=0)
+            loss_hist_epochs = []
+            start_time = time.time()
+            for epoch in range(self.args['epochs']['train']):
+                epoch_start = time.time()
+                if self.args['optimizer']['re_init_latents']: self.re_init_latents()
+                loss, _ = self.train_epoch(epoch, split='train')
+                loss_hist_epochs.append(loss)
+                print(
+                    f"Training: Epoch: {epoch}, Loss: {loss:.4f}, AvgLoss: {np.mean(loss_hist_epochs):.4f}, "
+                    f"Epoch Time: {time.time() - epoch_start:.2f}s, Total Time: {time.time() - start_time:.2f}s")
+                # Throttle image/figure logging to an every-Nth-validation cadence (disk-quota guard).
+                # Scalars still log every epoch (the wrapper only drops add_image/add_figure); the heavy
+                # per-eye image dumps fire only on image epochs (+ always the final epoch).
+                _real_writer = self.args.get('tb_writer', None)
+                _gate_images = self._images_enabled_this_epoch(epoch)
                 if _real_writer is not None:
-                    self.args['tb_writer'] = _real_writer
-            self._update_scheduler(split='train')
+                    self.args['tb_writer'] = _GatedImageWriter(_real_writer, _gate_images)
+                try:
+                    self.validate(epoch)
+                    self.run_time_sensitivity_probe(epoch)
+                    self.run_condition_sensitivity_probe(epoch)
+                finally:
+                    if _real_writer is not None:
+                        self.args['tb_writer'] = _real_writer
+                self._update_scheduler(split='train')
 
+            return np.mean(loss_hist_epochs)
+        finally:
+            self._in_training_loop = False
 
-        return np.mean(loss_hist_epochs)
+    def _should_save_figures(self, epoch, split):
+        """Gate heavy matplotlib figure rendering/saving (disk + TB) on log_images_every during
+        training; always enabled for test split and standalone evaluate.py runs."""
+        if split == 'test' or not getattr(self, '_in_training_loop', False):
+            return True
+        return self._images_enabled_this_epoch(epoch)
 
     def _images_enabled_this_epoch(self, epoch):
         """Decide whether THIS epoch may write images/figures to TensorBoard. Images log only on
@@ -582,20 +592,12 @@ class ModelBuilder:
                     loss_component_accum[key] = []
                 loss_component_accum[key].append(val)
 
-            # Log average loss components every 100 samples of 10k coordinates (i.e., 5 times for each 512x512 image)
-            if i % 100 == 0 or i == (len(sample_iterator) - 1):
+            # Throttle batch-level scalar logging to every 50 global steps (train only)
+            # and skip verbose per-visit stdout prints (epoch summary + tqdm already report progress).
+            if split == 'train' and (self.global_steps['train'] % 50 == 0):
                 loss_components_running_avg = {key: np.mean(vals) for key, vals in loss_component_accum.items()}
-                if split == 'train':
-                    log_loss(loss_components_running_avg, epoch, split='train_batch', log=self.args['logging'], tb_writer=tb_writer, global_step=self.global_steps['train'])
-                elif split == 'val':
-                    if sub_writer is not None:
-                        log_loss(loss_components_running_avg, epoch, split='val_inner_batch', log=self.args['logging'], tb_writer=sub_writer, global_step=self.global_steps['val'])
-                    elif tb_writer is not None:
-                        log_loss(loss_components_running_avg, epoch, split='val_inner_batch', log=self.args['logging'], tb_writer=tb_writer, global_step=self.global_val_steps_monotonic)
-                print(f"Split: {split}, Epoch: {epoch}, "
-                      f"Elapsed Training Time Batch: {time.time() - start_time:.2f}s"
-                      f"Progress: {i / len(sample_iterator):.2f},"
-                      f"Loss: {np.mean(loss_hist_samples):.4f},")
+                log_loss(loss_components_running_avg, epoch, split='train_batch',
+                         log=self.args['logging'], tb_writer=tb_writer, global_step=self.global_steps['train'])
                 
         if split == 'val' and sub_writer is not None:
             # 2F.1: Latent norm tracking
@@ -672,34 +674,24 @@ class ModelBuilder:
             # row2 is GT follow-up vs GT baseline, with per-column captions
             # (DICE + predicted lesion area for row1, GT lesion area for row2, on the segmentation modality; PSNR/SSIM on the image modality).
 
-            self._log_reconstruction_figures(train_data, 'train', epoch_train, tb_writer, tensorboard_tag='existing_visits')
+            if self._should_save_figures(epoch_train, 'train'):
+                self._log_reconstruction_figures(train_data, 'train', epoch_train, tb_writer, tensorboard_tag='existing_visits')
 
-            # if we have one latent per patient-eye (default strategy)
-            # for each of the three picked eyes: load and centre-crop every real GT visit, computes weeks-from-baseline --> chronological gt_visits
-            # if future=False --> interpolation: target prediction weeks are the midpoints between every pair of consecutive real GT visits
-            # if future=True --> extrapolation: target prediction weeks are the last GT visit's week plus configured offsets (default [26, 52, 78])
-            # _generate_novel_visits does the following:
-            # for each target week, builds an interpolated/extrapolated input row , computed (and caches) the synthesised image at that novel timepoint
-            # for each modality, merges the real GT visits and the synthetic predicted visits into one chronologically sorted list,
-            # centre-crops everything to common dimensions, and, for segmentation modality,
-            # captions each column with the lesion area measured directly from that column's own mask (GT mask for GT columns, predicted mask for prediction columns)
-            # builds an interleaved figure alternating GT and predicted columns along the time axis and logs it to Tensorboard
+                if not self.args['dataset'].get('independent_visits', False):
+                    # In-between visits predictions on the picked training subjects (interpolation)
+                    self._generate_novel_visits(epoch=epoch_train, split='train', subject_ids=picked_train_subs,
+                                                grid_coords=grid_coords, grid_shape=grid_shape, future=False)
 
-            if not self.args['dataset'].get('independent_visits', False):
-                 # In-between visits predictions on the picked training subjects (interpolation)
-                 self._generate_novel_visits(epoch=epoch_train, split='train', subject_ids=picked_train_subs,
-                                             grid_coords=grid_coords, grid_shape=grid_shape, future=False)
-             
-                 # Future visits predictions on the picked training subjects (extrapolation)
-                 self._generate_novel_visits(epoch=epoch_train, split='train', subject_ids=picked_train_subs,
-                                             grid_coords=grid_coords, grid_shape=grid_shape, future=True)
+                    # Future visits predictions on the picked training subjects (extrapolation)
+                    self._generate_novel_visits(epoch=epoch_train, split='train', subject_ids=picked_train_subs,
+                                                grid_coords=grid_coords, grid_shape=grid_shape, future=True)
 
-            # Generate and log summary figure for training subjects
-            if self.args['dataset'].get('dataset_name') == 'faf_ga':
-                self.log_publication_reconstruction_figure(
-                    epoch_train, 'train', picked_train_subs, opt_idcs=train_indices, eval_idcs=[],
-                    subject_data=train_data
-                )
+                # Generate and log summary figure for training subjects
+                if self.args['dataset'].get('dataset_name') == 'faf_ga':
+                    self.log_publication_reconstruction_figure(
+                        epoch_train, 'train', picked_train_subs, opt_idcs=train_indices, eval_idcs=[],
+                        subject_data=train_data
+                    )
 
         # Validation branch
         if is_val_epoch:
@@ -1821,8 +1813,10 @@ class ModelBuilder:
             if getattr(self, '_eval_sets', None) is None:
                 self._eval_sets = {}
             self._eval_sets[f'{split}_opt'] = opt_data
+        save_figs = self._should_save_figures(epoch_train, split)
         log_metrics(self.args, metrics_opt, epoch_train, split=f'{split}_opt_{tag_suffix}', tb_writer=tb_writer)
-        self._log_reconstruction_figures(opt_data, split, epoch_train, tb_writer, tensorboard_tag=f'{split}_opt_{tag_suffix}')
+        if save_figs:
+            self._log_reconstruction_figures(opt_data, split, epoch_train, tb_writer, tensorboard_tag=f'{split}_opt_{tag_suffix}')
         # 3. Evaluate on held-out visits
         eval_data = None
         eval_dice = None
