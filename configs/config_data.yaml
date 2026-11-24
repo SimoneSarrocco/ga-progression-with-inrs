@@ -132,8 +132,8 @@ faf_ga_twovar_wktemporal_512_to256:
   sampling_bbox: null
   metric_resize: [256, 256]
 
-# HARMONIZED OMEGA FAF+GA (healthy-retina quantile normalization [p40, p90] -> [0.45, 0.80]).
-# Equalizes healthy retinal brightness across visits & patients with zero cross-visit leakage.
+# HARMONIZED OMEGA FAF+GA (healthy-retina quantile normalization [p40, p90] -> [0.45, 0.70]).
+# Equalizes healthy retinal brightness across visits & patients at natural ~1.0x contrast with zero leakage.
 faf_ga_twovar_wktemporal_512_harmonized: &faf_ga_harmonized
   <<: *faf_ga
   normalize_values: 'healthy_quantile'
