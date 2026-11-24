@@ -25,10 +25,12 @@ class INR_Decoder(nn.Module):
         self.arch = args_inr.get('architecture', 'siren')
 
         # Optional INRAM-inspired Spatial Recombination Attention on the regular latent grid
+        # Automatically bypassed for 1D global latent vectors (e.g. latent_dim=[C, 1, 1]).
         la_cfg = args_inr.get('latent_attention', {}) or {}
         if isinstance(la_cfg, bool):
             la_cfg = {'activate': la_cfg}
-        if la_cfg.get('activate', False):
+        spatial_tokens = int(math.prod(args_inr['latent_dim'][1:])) if len(args_inr['latent_dim']) > 1 else 1
+        if la_cfg.get('activate', False) and spatial_tokens > 1:
             self.latent_attention = LatentSpatialAttention(
                 channels=args_inr['latent_dim'][0],
                 num_layers=la_cfg.get('num_layers', 1),

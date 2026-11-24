@@ -802,12 +802,42 @@ class ModelBuilder:
                     self.save_state(epoch_train, split='train', filename='checkpoint_best_loss.pth')
                     print(f"[checkpoint] New best val-eval LOSS {val_eval_loss:.4f} at epoch {epoch_train} "
                           f"-> saved checkpoint_best_loss.pth")
-                else:
+                    if selection_metric == 'loss':
+                        self.best_val_epoch = epoch_train
+                        self.save_state(epoch_train, split='train', filename='checkpoint_best.pth')
+                        print(f"[checkpoint] LOSS is the selection metric -> saved checkpoint_best.pth")
+                elif selection_metric == 'loss':
                     print(f"[checkpoint] val-eval LOSS {val_eval_loss:.4f} (best {self.best_val_loss:.4f} "
                           f"@ epoch {self.best_val_loss_epoch}); keeping previous best.")
                 if tb_writer is not None:
                     tb_writer.add_scalar("val/eval_loss_mean", val_eval_loss, epoch_train)
                     tb_writer.add_scalar("val/best_eval_loss", self.best_val_loss, epoch_train)
+
+            # Optional external callback (e.g. Optuna intermediate reporting & pruning).
+            # No-op unless args['_epoch_callback'] is supplied.
+            epoch_cb = self.args.get('_epoch_callback')
+            if callable(epoch_cb):
+                raw_m = getattr(self, '_last_round_eval_metrics', None) or []
+
+                def _agg_metric(key):
+                    vals = []
+                    for r in raw_m:
+                        v = r.get(key)
+                        if isinstance(v, (list, tuple)):
+                            v = v[0] if v else np.nan
+                        if isinstance(v, (int, float)) and not np.isnan(v):
+                            vals.append(float(v))
+                    return float(np.mean(vals)) if vals else float('nan')
+
+                epoch_cb(int(epoch_train), {
+                    'epoch': int(epoch_train),
+                    'DICE': float(val_eval_dice) if val_eval_dice is not None else _agg_metric('DICE'),
+                    'LOSS': float(val_eval_loss) if val_eval_loss is not None else _agg_metric('LOSS'),
+                    'PSNR': _agg_metric('PSNR'),
+                    'SSIM': _agg_metric('SSIM'),
+                    'LPIPS': _agg_metric('LPIPS'),
+                    'HD': _agg_metric('HD'),
+                })
 
     def _lesion_px_area_mm2(self, row_dict):
         """SINGLE SOURCE OF TRUTH for mm^2-per-GA-pixel. = ScaleXSlo*ScaleYSlo (native mm/px) * rf,
