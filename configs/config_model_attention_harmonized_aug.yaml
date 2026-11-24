@@ -173,8 +173,8 @@ epochs:
   train: 50
   val: 25
 validate_every: 5
-batch_size: 1
-n_samples: 10000
+batch_size: 4
+n_samples: 20000
 num_workers: 16
 
 # --------- Lesion-size analysis ---------

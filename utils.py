@@ -243,8 +243,24 @@ class Criterion(nn.Module):
             return -(target_prob * logp).sum(dim=-1).mean()
         return self.criterion_seg(seg_logits, target[..., self.seg_target_channel].to(torch.int64))
 
+    def _per_eye_or_pooled(self, fn, seg_logits, target_prob, idcs_df=None):
+        """Compute region loss (SoftDice / Tversky) per eye and average when a batch mixes >1 eyes,
+        so large GA lesions never swamp small GA lesions. Identical to pooled loss for batch_size=1."""
+        if idcs_df is not None:
+            idcs_flat = idcs_df.reshape(-1)
+            unique_subs = torch.unique(idcs_flat)
+            if unique_subs.numel() > 1:
+                per_eye = []
+                for s in unique_subs:
+                    m = (idcs_flat == s)
+                    if m.any():
+                        per_eye.append(fn(seg_logits[m], target_prob[m]))
+                if per_eye:
+                    return torch.stack(per_eye).mean()
+        return fn(seg_logits, target_prob)
+
     def forward(self, output, target, sr_weight=None, seg_weight=1.0,
-                active_reconstruction_modalities=None):
+                active_reconstruction_modalities=None, idcs_df=None):
         # Components are stored UNWEIGHTED (raw) for interpretable logging; the
         # sr_weight / seg_weight factors are applied only once, in loss['total'].
         sr_weight = self.sr_weight if sr_weight is None else sr_weight
@@ -270,9 +286,11 @@ class Criterion(nn.Module):
             seg_loss = self._seg_ce(seg_logits, target, target_prob)
             if self.tversky_active:
                 # Tversky replaces the Dice term (Dice == Tversky with alpha=beta=0.5).
-                seg_loss = seg_loss + self.tversky_weight * self._tversky_loss(seg_logits, target_prob)
+                seg_loss = seg_loss + self.tversky_weight * self._per_eye_or_pooled(
+                    self._tversky_loss, seg_logits, target_prob, idcs_df=idcs_df)
             elif self.seg_dice_weight > 0:
-                seg_loss = seg_loss + self.seg_dice_weight * self._soft_dice_loss(seg_logits, target_prob)
+                seg_loss = seg_loss + self.seg_dice_weight * self._per_eye_or_pooled(
+                    self._soft_dice_loss, seg_logits, target_prob, idcs_df=idcs_df)
             loss['seg'] = seg_loss
 
         loss['total'] = sr_weight * loss['sr'] + seg_weight * loss['seg']

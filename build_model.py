@@ -453,21 +453,13 @@ class ModelBuilder:
         tb_writer = self.args.get('tb_writer', None)
 
         for batch in self.dataloaders[split]:
-            print(f"Split: {split}, Current Epoch: {epoch}, Time Loading Batch: {time.time() - time_data_loader:.2f}s")
-            start_time = time.time()
             loss, loss_components = self.train_batch(batch, epoch, split, epoch_train=epoch_train, sub_writer=sub_writer)
             loss_hist_batches.append(loss)  # we store the average loss for each batch
             # Accumulate average loss components for each batch
             for key, val in loss_components.items():
-               if key not in loss_component_accum:
-                   loss_component_accum[key] = []
-               loss_component_accum[key].append(val)
-            
-            # Update progress bar trailing text instead of printing multiple lines
-            # pbar.set_postfix({'loss': f"{np.mean(loss_hist_batches):.4f}", 'time/batch': f"{time.time() - start_time:.2f}s"})
-            time_data_loader = time.time() # Reset clock for next batch loading time
-            print(
-                f"Split: {split}, Current Epoch: {epoch}, Loss Batch: {loss:.4f}, Total Training Time Batch: {time.time() - start_time:.2f}s")
+                if key not in loss_component_accum:
+                    loss_component_accum[key] = []
+                loss_component_accum[key].append(val)
 
         # Average the components across the entire epoch
         epoch_avg_loss = {key: np.mean(vals) for key, vals in loss_component_accum.items()}
@@ -543,7 +535,8 @@ class ModelBuilder:
                                                    time_vals=time_vals)
                 loss = self.loss_criterion(
                     values_p, values, seg_weight=seg_weight,
-                    active_reconstruction_modalities=self._reconstruction_modalities_for_loss(split))
+                    active_reconstruction_modalities=self._reconstruction_modalities_for_loss(split),
+                    idcs_df=idx_df)
 
             # Anchored latent regularisation during TTA (val/test). The latent is fit on the
             # reconstruction loss only, which is heavily under-determined; this L2 term keeps it
