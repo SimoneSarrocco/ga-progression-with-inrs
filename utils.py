@@ -1124,14 +1124,36 @@ def load_2d_modality(path: str, is_seg: bool, patient_stats: dict = None, mod_in
     # training data (dataset.py). Detected from the path (…/OS/… or …_OS_…). Must match dataset.py's
     # PIL FLIP_LEFT_RIGHT -> horizontal flip = data[:, ::-1].
     if args is not None and args.get('dataset', {}).get('canonicalize_laterality', False):
-        pu = path.upper(); base = os.path.basename(pu)
-        if '/OS/' in pu or '_OS_' in base or base.rsplit('.', 1)[0].endswith('_OS'):
+        pu = path.upper()
+        base = os.path.basename(pu)
+        stem = base[:-7] if base.endswith('.NII.GZ') else os.path.splitext(base)[0]
+        if '/OS/' in pu or '_OS_' in base or stem.endswith('_OS'):
             data = data[:, ::-1].copy()
 
     if is_seg:
         return (data > 0).astype(np.float32)
     else:
         data = data.astype(np.float32)
+        norm_type = args.get('dataset', {}).get('normalize_values', 'minmax') if args is not None else 'minmax'
+        if norm_type == 'healthy_quantile':
+            return healthy_quantile_normalize(data)
+        if norm_type == 'minmax_patient_robust':
+            p1, p99 = np.percentile(data, [1, 99])
+            if p99 > p1:
+                return np.clip((data - float(p1)) / float(p99 - p1), 0.0, 1.0).astype(np.float32)
+            return np.zeros_like(data)
+        if norm_type == 'ref_match' and patient_stats is not None and 'ref_med' in patient_stats:
+            i = mod_index if 0 <= mod_index < np.asarray(patient_stats['ref_med']).size else 0
+            ref_med = float(np.asarray(patient_stats['ref_med']).reshape(-1)[i])
+            ref_iqr = float(np.asarray(patient_stats['ref_iqr']).reshape(-1)[i])
+            ref_p1 = float(np.asarray(patient_stats['ref_p1']).reshape(-1)[i])
+            ref_p99 = float(np.asarray(patient_stats['ref_p99']).reshape(-1)[i])
+            m_v = float(np.median(data))
+            q25, q75 = np.percentile(data, [25, 75])
+            s_v = max(float(q75 - q25), 1e-6)
+            matched = (data - m_v) / s_v * ref_iqr + ref_med
+            denom = ref_p99 - ref_p1 if (ref_p99 - ref_p1) > 0 else 1.0
+            return np.clip((matched - ref_p1) / denom, 0.0, 1.0).astype(np.float32)
         if patient_stats is not None and 'min' in patient_stats and 'max' in patient_stats:
             mn_arr = np.asarray(patient_stats['min']).reshape(-1)
             mx_arr = np.asarray(patient_stats['max']).reshape(-1)
@@ -1347,6 +1369,29 @@ def log_loss(loss, epoch, split, log=True, tb_writer=None, global_step=None):
         tb_writer.flush()
 
 
+def healthy_quantile_normalize(arr: np.ndarray, q_lo: float = 40.0, q_hi: float = 90.0,
+                               t_lo: float = 0.45, t_hi: float = 0.80) -> np.ndarray:
+    """
+    Per-visit healthy-retina quantile intensity harmonization into [0, 1].
+    Maps foreground (arr > 0) percentiles [q_lo, q_hi] linearly onto [t_lo, t_hi] and clips to [0, 1].
+    q_lo=40 sits strictly above even large GA lesions (~30% max FOV area) and q_hi=90 sits below
+    saturated vessel/border hot-spots, equalizing healthy retinal brightness across visits and
+    patients with zero cross-visit leakage while preserving dark GA contrast and hyper-AF rims.
+    """
+    arr = np.asarray(arr, dtype=np.float32)
+    fg = arr[arr > 0]
+    if fg.size == 0:
+        fg = arr.ravel()
+    if fg.size == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    p_lo, p_hi = np.percentile(fg, [q_lo, q_hi])
+    scale = float(p_hi - p_lo)
+    if scale < 1e-6:
+        return _minmax(arr).astype(np.float32)
+    out = t_lo + (arr - float(p_lo)) / scale * (t_hi - t_lo)
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
 def normalize_intensities(values, norm_type, has_seg=True, reconstruction_indices=None):
     """Normalise reconstruction channels independently, leaving segmentation targets unchanged."""
     values = np.clip(values, 0, None)
@@ -1358,6 +1403,9 @@ def normalize_intensities(values, norm_type, has_seg=True, reconstruction_indice
         denom = v_max - v_min
         denom[denom == 0] = 1.0
         values[..., reconstruction_indices] = (values_mod - v_min) / denom
+    elif norm_type == 'healthy_quantile':
+        for c in reconstruction_indices:
+            values[..., c] = healthy_quantile_normalize(values[..., c])
     elif norm_type == 'zscore':
         values_mod = values[..., reconstruction_indices]
         v_mean, v_std = values_mod.mean(axis=0), values_mod.std(axis=0)

@@ -2151,14 +2151,10 @@ class ModelBuilder:
         return volume_inf
 
     def _get_patient_stats(self, split, sub_id_int):
-        """Retrieve patient-level min/max stats for normalisation."""
+        """Retrieve patient-level intensity stats for normalisation (minmax_patient or ref_match)."""
         dataset = self.datasets[split]
         if hasattr(dataset, 'patient_stats') and sub_id_int in dataset.patient_stats:
-            p_stats = dataset.patient_stats[sub_id_int]
-            return {
-                'min': p_stats['min'],
-                'max': p_stats['max']
-            }
+            return dict(dataset.patient_stats[sub_id_int])
         return None
 
     def _log_reconstruction_figures(self, subject_data, split, epoch, tb_writer, tensorboard_tag=''):

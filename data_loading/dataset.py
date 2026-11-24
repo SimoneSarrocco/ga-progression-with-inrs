@@ -7,7 +7,9 @@ import pandas as pd
 from torch.utils.data import Dataset
 from utils import *
 from .lakefs_config import make_loader, resolve_cache_path
+from .image_io import load_grayscale_image
 from PIL import Image
+from scipy import ndimage as ndi
 import yaml
 import copy
 
@@ -939,7 +941,69 @@ class Data(Dataset):
                                                reconstruction_indices=recon_idcs)
         return coords, values
     
+    @staticmethod
+    def _apply_virtual_eye_transform(data, tf, is_seg):
+        """
+        Apply a deterministic, trajectory-consistent 2D spatial transform (flips + centered
+        rotation, isotropic zoom, and translation) to a single modality array.
+        Uses nearest-neighbor (order=0) for segmentation masks and bilinear (order=1) for
+        intensity modalities so all modalities stay pixel-aligned and masks stay exact.
+        """
+        arr = np.asarray(data, dtype=np.float32).copy()
+        squeeze_last = False
+        if arr.ndim == 3 and arr.shape[2] == 1:
+            arr = arr[..., 0]
+            squeeze_last = True
+        if arr.ndim != 2:
+            raise ValueError(f"virtual_eyes augmentation supports 2D images, got shape {arr.shape}")
+
+        if tf.get('hflip', False):
+            arr = arr[:, ::-1].copy()
+        if tf.get('vflip', False):
+            arr = arr[::-1, :].copy()
+
+        angle_deg = float(tf.get('angle_deg', 0.0))
+        scale = float(tf.get('scale', 1.0))
+        tx_frac = float(tf.get('tx_frac', 0.0))
+        ty_frac = float(tf.get('ty_frac', 0.0))
+
+        if abs(angle_deg) > 1e-6 or abs(scale - 1.0) > 1e-6 or abs(tx_frac) > 1e-6 or abs(ty_frac) > 1e-6:
+            h, w = arr.shape
+            cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+            tx = tx_frac * w
+            ty = ty_frac * h
+            theta = math.radians(angle_deg)
+            c, s = math.cos(theta), math.sin(theta)
+            inv_scale = 1.0 / max(scale, 1e-6)
+            # Inverse mapping p_in = M @ p_out + offset for forward p_out - c = scale * R(theta)(p_in - c) + t
+            M = inv_scale * np.array([[c, s], [-s, c]], dtype=np.float64)
+            center = np.array([cy, cx], dtype=np.float64)
+            shift = np.array([ty, tx], dtype=np.float64)
+            offset = center - M @ (center + shift)
+            order = 0 if is_seg else 1
+            arr = ndi.affine_transform(
+                arr, matrix=M, offset=offset, order=order, mode='constant', cval=0.0
+            ).astype(np.float32)
+
+        if squeeze_last:
+            arr = arr[..., np.newaxis]
+        return arr
+
     def augment_modalities(self, modalities, row_dict):
+        if getattr(self, 'virtual_eyes_aug', False):
+            eye_id = row_dict.get(self.id_column)
+            tf = getattr(self, '_virtual_eye_transforms', {}).get(eye_id)
+            if tf is None:
+                return {mod_key: modalities[mod_key].get_fdata() for mod_key in modalities}
+            has_seg = self.args['inr_decoder']['out_dim'][-1] > 0
+            seg_key = segmentation_modality(self.args) if has_seg else None
+            return {
+                mod_key: self._apply_virtual_eye_transform(
+                    modalities[mod_key].get_fdata(), tf, is_seg=(has_seg and mod_key == seg_key)
+                )
+                for mod_key in modalities
+            }
+
         if self.data_augmentation:
             sub_id = row_dict.get('sub_id_int', 0)
             epoch = getattr(self, 'epoch', 0)
@@ -1569,14 +1633,88 @@ class Data(Dataset):
 
     def _init_data_augmentation(self):
         """
-        Initialise data augmentation.
+        Initialise data augmentation (training split only).
+        Supported modes:
+          - 'stochastic'   : per-load random translation/noise (existing behaviour)
+          - 'virtual_eyes' : trajectory-consistent virtual training eyes, each assigned its own
+                             unique Eye_ID (`<eye>__aug<k>` / `<eye>__aug_rebase`) and dedicated
+                             learnable latent grid so spatial transforms never smear a shared latent.
         """
-        aug_cfg = self.args['data_augmentation']
+        aug_cfg = self.args.get('data_augmentation') or {}
         mode = aug_cfg.get('mode', 'stochastic')
-        # Only the 'stochastic' mode is implemented: per-load translation/noise (augment_modalities),
-        # on the training split only. Fail loudly on any other mode instead of silently training
-        # without augmentation.
-        if aug_cfg.get('activate', False) and mode != 'stochastic':
+        active = bool(aug_cfg.get('activate', False))
+
+        if active and mode not in ('stochastic', 'virtual_eyes'):
             raise ValueError(f"data_augmentation.mode '{mode}' is not implemented; use 'stochastic' "
-                             f"or set data_augmentation.activate: false.")
-        self.data_augmentation = bool(aug_cfg.get('activate', False)) and (self.split == 'train') and (mode == 'stochastic')
+                             f"or 'virtual_eyes', or set data_augmentation.activate: false.")
+
+        self.data_augmentation = active and (self.split == 'train') and (mode == 'stochastic')
+        self.virtual_eyes_aug = active and (self.split == 'train') and (mode == 'virtual_eyes')
+        self._virtual_eye_transforms = {}
+
+        if not self.virtual_eyes_aug or self.df.empty:
+            return
+
+        if self.id_column not in self.df.columns:
+            raise ValueError(f"virtual_eyes augmentation requires id_column '{self.id_column}' in dataframe.")
+
+        ve_cfg = aug_cfg.get('virtual_eyes', {}) or {}
+        n_copies = int(ve_cfg.get('n_copies', 4))
+        hflip_first = bool(ve_cfg.get('hflip_first', True))
+        hflip_p = float(ve_cfg.get('hflip_p', 0.5))
+        vflip_p = float(ve_cfg.get('vflip_p', 0.3))
+        max_rot_deg = float(ve_cfg.get('max_rot_deg', 15.0))
+        max_shift_frac = float(ve_cfg.get('max_shift_frac', 0.05))
+        scale_range = ve_cfg.get('scale_range', [0.95, 1.05])
+        s_lo, s_hi = float(scale_range[0]), float(scale_range[1])
+        rebaseline = bool(ve_cfg.get('rebaseline_subtrajectories', True))
+
+        seed = int(self.args.get('seed', 1927))
+        rng = np.random.RandomState(seed + 4242)
+
+        base_df = self.df.copy()
+        base_df['aug_id'] = 0
+        real_eyes = sorted(base_df[self.id_column].unique())
+        tkey = self._get_temporal_key()
+
+        extra_dfs = []
+        for eye_id in real_eyes:
+            eye_df = base_df[base_df[self.id_column] == eye_id]
+
+            for k in range(1, n_copies + 1):
+                if k == 1 and hflip_first:
+                    tf = {
+                        'hflip': True, 'vflip': False,
+                        'angle_deg': 0.0, 'tx_frac': 0.0, 'ty_frac': 0.0, 'scale': 1.0,
+                    }
+                else:
+                    tf = {
+                        'hflip': bool(rng.rand() < hflip_p),
+                        'vflip': bool(rng.rand() < vflip_p),
+                        'angle_deg': float(rng.uniform(-max_rot_deg, max_rot_deg)) if max_rot_deg > 0 else 0.0,
+                        'tx_frac': float(rng.uniform(-max_shift_frac, max_shift_frac)) if max_shift_frac > 0 else 0.0,
+                        'ty_frac': float(rng.uniform(-max_shift_frac, max_shift_frac)) if max_shift_frac > 0 else 0.0,
+                        'scale': float(rng.uniform(s_lo, s_hi)) if s_hi > s_lo else 1.0,
+                    }
+                v_eye_id = f"{eye_id}__aug{k}"
+                copy_df = eye_df.copy()
+                copy_df[self.id_column] = v_eye_id
+                copy_df['aug_id'] = k
+                self._virtual_eye_transforms[v_eye_id] = tf
+                extra_dfs.append(copy_df)
+
+            if rebaseline and 'weeks_from_baseline' in eye_df.columns and len(eye_df) >= 3:
+                sorted_eye = eye_df.sort_values(tkey).copy()
+                sub_df = sorted_eye.iloc[1:].copy()
+                t0 = float(sub_df.iloc[0]['weeks_from_baseline'])
+                sub_df['weeks_from_baseline'] = sub_df['weeks_from_baseline'].astype(float) - t0
+                v_eye_id = f"{eye_id}__aug_rebase"
+                sub_df[self.id_column] = v_eye_id
+                sub_df['aug_id'] = n_copies + 1
+                self._virtual_eye_transforms[v_eye_id] = None
+                extra_dfs.append(sub_df)
+
+        self.df = pd.concat([base_df] + extra_dfs, ignore_index=True)
+        n_total_eyes = self.df[self.id_column].nunique()
+        print(f"[{self.split}] virtual_eyes augmentation: {len(real_eyes)} real eyes ({len(base_df)} visits) -> "
+              f"{n_total_eyes} total eyes ({len(self.df)} visits), each with a dedicated latent grid.")

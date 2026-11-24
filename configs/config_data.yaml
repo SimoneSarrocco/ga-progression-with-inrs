@@ -131,3 +131,64 @@ faf_ga_twovar_wktemporal_512_to256:
   world_bbox: [512, 512]
   sampling_bbox: null
   metric_resize: [256, 256]
+
+# HARMONIZED OMEGA FAF+GA (healthy-retina quantile normalization [p40, p90] -> [0.45, 0.80]).
+# Equalizes healthy retinal brightness across visits & patients with zero cross-visit leakage.
+faf_ga_twovar_wktemporal_512_harmonized: &faf_ga_harmonized
+  <<: *faf_ga
+  normalize_values: 'healthy_quantile'
+  train_coordinates_per_visit: 60000
+  crop_before_resize: [620, 620]
+  world_bbox: [512, 512]
+  sampling_bbox: null
+
+faf_ga_twovar_wktemporal_620_harmonized:
+  <<: *faf_ga_harmonized
+  train_coordinates_per_visit: 0
+  crop_before_resize: null
+  world_bbox: [620, 620]
+  sampling_bbox: [620, 620]
+
+faf_ga_twovar_wktemporal_512_to256_harmonized:
+  <<: *faf_ga_harmonized
+  train_coordinates_per_visit: 0
+  metric_resize: [256, 256]
+
+
+# MACUSTAR reconstruction-only registered FAF. Paths and patient-wise splits come from the validated
+# survival metadata, but no event/censoring labels are loaded. Full 768x768 FOV -> 512 grid.
+macustar_faf_512:
+  dataset_name: macustar_faf
+  independent_visits: false
+  subject_ids: ./configs/subject_ids.yaml
+  expected_split: ./configs/expected_split_macustar.yaml
+  id_column: Eye_ID
+  split_column: split
+  tsv_file: ./data/macustar_faf_metadata.csv
+  modalities: ['faf_path']
+  modality_roles:
+    faf_path: reconstruction
+  primary_reconstruction_modality: faf_path
+  conditions:
+    AgeatVisit: true
+    weeks_from_baseline: true
+  temporal_condition: weeks_from_baseline
+  extrapolate_beyond_range: true
+  weeks_constraint_from_dates: false
+  min_valid_visits_eval: 2
+  constraints:
+    weeks_from_baseline:
+      type: numeric
+      min: 0.0
+      max: 210.0
+    AgeatVisit:
+      type: numeric
+      min: 55.0
+      max: 90.0
+  sampling_strategy: 'all'
+  train_coordinates_per_visit: 100000
+  normalize_values: 'minmax'
+  canonicalize_laterality: false
+  crop_before_resize: null
+  world_bbox: [512, 512]
+  sampling_bbox: null
